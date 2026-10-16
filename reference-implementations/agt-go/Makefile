@@ -75,6 +75,7 @@ help:
 setup: host-target require-bun agt-native
 	$(GO) mod download
 	cd ../agt && bun install --frozen-lockfile
+	cd ../../adapters/openclaw && bun install --frozen-lockfile
 
 agt-native:
 	$(call check-start,AGT runtime)
@@ -146,6 +147,7 @@ example-check: example-runtime require-bun
 	$(GO) test ./examples/opencode/cmd/acs-opencode-hook
 	$(GO) build -o .acs/bin/acs-opencode-hook ./examples/opencode/cmd/acs-opencode-hook
 	ACS_HOST_EXAMPLE_PORT=0 scripts/run-host-example.sh bun test examples/opencode/plugin.test.mjs
+	ACS_HOST_EXAMPLE_PORT=0 ACS__SECURITY__HMAC_KEY_ID=openclaw-e2e ACS_HMAC_KEY_ID=openclaw-e2e ACS_HMAC_SECRET_FILE='$(CURDIR)/.acs/hmac-secret' scripts/run-host-example.sh bun test ../../adapters/openclaw/tests/go-guardian.e2e.ts
 	bash -n scripts/run-host-example.sh
 	$(call check-pass,Examples)
 

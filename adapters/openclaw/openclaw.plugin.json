@@ -1,0 +1,116 @@
+{
+  "id": "acs-guardian-client",
+  "name": "Agent Control Standard",
+  "description": "Sends each agent step, signed, to an ACS Guardian and enforces its decision.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "agentToolResultMiddleware": [
+      "openclaw"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "guardianUrl",
+      "keyId",
+      "hkdf"
+    ],
+    "oneOf": [
+      {
+        "required": [
+          "keyFile"
+        ]
+      },
+      {
+        "required": [
+          "keyEnv"
+        ]
+      }
+    ],
+    "properties": {
+      "guardianUrl": {
+        "type": "string",
+        "format": "uri",
+        "description": "The Guardian's ACS endpoint."
+      },
+      "keyId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The key_id the Guardian knows the shared key by."
+      },
+      "keyFile": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A file whose bytes are the shared key."
+      },
+      "keyEnv": {
+        "type": "string",
+        "minLength": 1,
+        "description": "An environment variable whose value is the shared key."
+      },
+      "hkdf": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "salt",
+          "infoPrefix",
+          "sessionIdEncoding"
+        ],
+        "description": "How the Guardian derives each session's HMAC key from the shared key.",
+        "properties": {
+          "salt": {
+            "type": "string"
+          },
+          "infoPrefix": {
+            "type": "string"
+          },
+          "sessionIdEncoding": {
+            "enum": [
+              "utf8",
+              "uuid-bytes"
+            ]
+          }
+        }
+      },
+      "failurePosture": {
+        "enum": [
+          "closed",
+          "negotiated"
+        ]
+      },
+      "deadlineMs": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "The longest one hook waits for the Guardian, every step it sends and its handshakes included. Shorter than hookTimeoutMs."
+      },
+      "hookTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "The timeout the plugin asks OpenClaw to give each of its hooks. Longer than deadlineMs, so the plugin answers before OpenClaw gives up on the hook; OpenClaw's message_sending sends the original message on a timeout."
+      },
+      "maxUndecidedMessages": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "The most messages of one session the plugin keeps for a run not yet admitted. A message beyond it is dropped with blockedReplyText."
+      },
+      "approvers": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "blockedReplyText": {
+        "type": "string",
+        "minLength": 1
+      },
+      "auditLog": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

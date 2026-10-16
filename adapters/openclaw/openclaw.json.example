@@ -1,0 +1,53 @@
+{
+  "plugins": {
+    "entries": {
+      "acs-guardian-client": {
+        "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
+        "config": {
+          "guardianUrl": "http://127.0.0.1:8787/acs",
+          "keyId": "default",
+          "keyEnv": "ACS_HMAC_SECRET",
+          "hkdf": {
+            "salt": "",
+            "infoPrefix": "",
+            "sessionIdEncoding": "utf8"
+          },
+          "approvers": [
+            "approver-1"
+          ],
+          "blockedReplyText": "Sorry, I cannot send that reply."
+        }
+      }
+    }
+  },
+  "commands": {
+    "allowFrom": {
+      "signal": [
+        "+15550111"
+      ]
+    }
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "acp": {
+    "enabled": false
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-6-astra"
+      },
+      "models": {
+        "openai/gpt-6-astra": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        }
+      }
+    }
+  }
+}

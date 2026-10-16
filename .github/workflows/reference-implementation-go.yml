@@ -6,7 +6,8 @@
 # matching them. The AGT bundle and mapping are in it because the Go Guardian reads
 # them from reference-implementations/agt/. The shared conformance package is
 # included because make check runs it against the Go Guardian, and the host
-# adapter because the conformance package signs with it.
+# adapter because the conformance package signs with it. The OpenClaw adapter is
+# included because make check runs its live test against the Go Guardian.
 #
 # Native platforms run the complete gate. The pure job also checks cgo is absent.
 #
@@ -25,6 +26,7 @@ on:
       - "reference-implementations/agt/packages/agt-bridge/package.json"
       - "reference-implementations/agt/packages/conformance/**"
       - "reference-implementations/agt/packages/host-adapter/src/**"
+      - "adapters/openclaw/**"
       - "reference-implementations/agt/package.json"
       - "reference-implementations/agt/bun.lock"
       - "specification/**"
@@ -42,6 +44,7 @@ on:
       - "reference-implementations/agt/packages/agt-bridge/package.json"
       - "reference-implementations/agt/packages/conformance/**"
       - "reference-implementations/agt/packages/host-adapter/src/**"
+      - "adapters/openclaw/**"
       - "reference-implementations/agt/package.json"
       - "reference-implementations/agt/bun.lock"
       - "specification/**"

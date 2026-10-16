@@ -21,6 +21,7 @@ on:
       # The conformance checker and the trace exporter read the schemas and
       # the Trace mappings at runtime, so a spec-only change can break them.
       - "specification/**"
+      - "adapters/openclaw/**"
       - ".github/workflows/reference-implementation.yml"
   push:
     branches: ["main", "integration"]
@@ -29,6 +30,7 @@ on:
       # The conformance checker and the trace exporter read the schemas and
       # the Trace mappings at runtime, so a spec-only change can break them.
       - "specification/**"
+      - "adapters/openclaw/**"
       - ".github/workflows/reference-implementation.yml"
   workflow_dispatch:
 
@@ -81,5 +83,34 @@ jobs:
       # Every envelope validates against ../../../../../specification/v0.1.0/ by
       # relative path, so this also proves the implementation still matches the
       # schemas in this repository rather than a copy of them.
+      - name: Run the tests
+        run: bun test
+
+  # The OpenClaw adapter imports packages/host-adapter from the tree above by
+  # path, so a change on either side runs it.
+  openclaw-adapter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: adapters/openclaw
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install dependencies from the lockfile
+        run: bun install --frozen-lockfile
+
+      - name: Type check
+        run: bun run typecheck
+
       - name: Run the tests
         run: bun test
