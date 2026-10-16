@@ -184,7 +184,7 @@ describe("createAuditSink", () => {
     // through the union does not compile. Throwing rather than optional-
     // chaining keeps the three assertions below load-bearing -- `entry?.failure`
     // on the wrong arm would read `undefined` and quietly assert nothing.
-    if (entry === undefined || entry.outcome === "ungoverned") {
+    if (entry === undefined || (entry.outcome !== "proceeded" && entry.outcome !== "blocked")) {
       throw new Error(`expected a posture-resolved entry, got ${JSON.stringify(entry)}`);
     }
     expect(entry.posture).toBe("proceed");

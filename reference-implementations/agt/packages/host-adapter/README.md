@@ -1,6 +1,6 @@
 # Host adapter
 
-The host side of the wire, shared by both host shims. It turns a host's own hook payload into an ACS envelope, negotiates the session with the Guardian, posts the envelope, validates the decision that comes back, applies the failure posture when no decision arrives, renders the decision in the host's own output shape, and writes the audit log.
+The host side of the wire, shared by every host shim. It turns a host's own hook payload into an ACS envelope, negotiates the session with the Guardian, posts the envelope, validates the decision that comes back, applies the failure posture when no decision arrives, renders the decision in the host's own output shape, and writes the audit log.
 
 It contains no policy-runtime vocabulary and names no host output field. Both boundaries are enforced by [`test/invariants.test.ts`](../../test/invariants.test.ts) at the root of the tree. A second host arrives as another thin shim against this package, unchanged.
 
@@ -29,17 +29,23 @@ A hook may carry a `tools` list. A tool outside that list is not governed, and `
 |---|---|
 | A decision arrives | It is honoured. The posture never touches it |
 | The Guardian answers with a JSON-RPC error, or refuses a schema-invalid envelope | An honoured `deny`, whatever the posture |
-| A timeout, a transport failure, or an error with no decision | The negotiated posture applies. `proceed` proceeds and writes an audit entry. `deny` blocks. The three cases write three different audit entries |
+| A timeout, a transport failure, or an error with no decision | The negotiated posture applies. `proceed` proceeds and writes an audit entry. `deny` blocks. The three cases write three different audit entries. A shim that passes `hostPosture: "deny"` blocks whatever was negotiated |
 | The posture says proceed and the audit entry cannot be written | A block |
 | An `ask` or `defer` whose timeout has passed | Its own timeout default |
 | Malformed `modifications` | Fails closed |
 | A modification the host cannot apply | Refused. At the result gate the refusal withholds the output |
 
-`DEFAULT_POSTURE` and `DEFAULT_TIMEOUT_MS` are exported so both shims agree without one copying the other's number. The stage at which a failure happened, before the request was built, after it went out, or after a decision arrived that the host could not express, is recorded on the audit entry, because the three are different incidents.
+`DEFAULT_POSTURE` and `DEFAULT_TIMEOUT_MS` are exported so the shims agree without one copying the other's number. The stage at which a failure happened, before the request was built, after it went out, or after a decision arrived that the host could not express, is recorded on the audit entry, because the three are different incidents.
+
+## Signatures
+
+`createGuardianClient(url, { signingKey })` signs every request and verifies every result under §10: HMAC-SHA256 over the RFC 8785 canonical form of the envelope without its `signature`, under a per-session key derived with HKDF-SHA256. A result whose signature does not verify is a delivery failure, never a decision. Error responses are not verified, because a Guardian answers a request it could not authenticate with an unsigned error, and an error never becomes a decision.
+
+§10 leaves the HKDF salt and info open, so `SigningKey.hkdf` carries them: info is `infoPrefix` followed by the session id as UTF-8 text or as the UUID's 16 bytes. `test/signature.test.ts` checks the result against the Go Guardian's own vectors. The Claude Code and OpenCode shims create their client without a key and send unsigned envelopes.
 
 ## The audit log
 
-The shim tells `createAuditSink` where to write. Both shims default to `.acs/audit.jsonl` and read `ACS_AUDIT_LOG` to override it. One line is written per fail-open proceed, per posture-driven block, and per ungoverned skip. The entry keeps the host's raw session id. The envelope carries a UUID derived from it by `toSessionUuid`, because the ACS schema requires a UUID, so the two logs cannot be joined on that field.
+The shim tells `createAuditSink` where to write. The Claude Code and OpenCode shims default to `.acs/audit.jsonl` and read `ACS_AUDIT_LOG` to override it; the OpenClaw plugin reads its `auditLog` setting. One line is written per fail-open proceed, per posture-driven block, and per ungoverned skip. A shim that resolves an `ask` itself writes an `approval` line, and a shim that blocks a decision it cannot carry out writes a `substituted` line (§6.5). The entry keeps the host's raw session id. The envelope carries a UUID derived from it by `toSessionUuid`, because the ACS schema requires a UUID, so the two logs cannot be joined on that field.
 
 ## Files
 
@@ -49,6 +55,7 @@ The shim tells `createAuditSink` where to write. Both shims default to `.acs/aud
 | `src/hookmap-path.ts`, `src/reserved-segments.ts` | The path notation and the segments it refuses |
 | `src/handshake.ts`, `src/session-config.ts` | Negotiation, and the file and memory stores for the negotiated ServerHello |
 | `src/guardian-client.ts` | The HTTP client and its error types |
+| `src/signature.ts` | RFC 8785 canonical JSON, the HKDF session key, and signing and verifying an envelope |
 | `src/govern-step.ts` | The sequence one governed step runs, with a guarded stage for each failure kind |
 | `src/validate-decision.ts`, `src/decision-expiry.ts`, `src/decision-message.ts` | What a decision must look like before it is honoured |
 | `src/failure-posture.ts`, `src/failure-kinds.ts` | The posture and the classification of each failure |
@@ -63,4 +70,4 @@ The shim tells `createAuditSink` where to write. Both shims default to `.acs/aud
 bun test packages/host-adapter
 ```
 
-Eleven files. They drive each function against fixed payloads and against a real Guardian where the assertion needs one.
+Twelve files. They drive each function against fixed payloads and against a real Guardian where the assertion needs one.

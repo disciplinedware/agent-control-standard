@@ -1,4 +1,5 @@
-import { createHmac, hkdfSync, randomUUID, timingSafeEqual } from "node:crypto";
+import { canonicalJson, deriveSessionKey, type HkdfParameters } from "host-adapter";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 export const EXTERNAL_GUARDIAN_URL_ENV = "ACS_CONFORMANCE_GUARDIAN_URL";
@@ -18,21 +19,8 @@ export type ExternalGuardianCheck =
   | { ran: false; reason: string }
   | { ran: true; probes: number };
 
-export function canonicalJSON(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("JCS input contains a non-finite number");
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJSON).join(",")}]`;
-  }
-  if (typeof value !== "object") throw new Error(`JCS input contains ${typeof value}`);
-  const object = value as JsonObject;
-  return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJSON(object[key])}`).join(",")}}`;
-}
+/** The Go reference Guardian's §10 key derivation: no salt, the UTF-8 session id as info. */
+const GO_GUARDIAN_HKDF: HkdfParameters = { salt: "", infoPrefix: "", sessionIdEncoding: "utf8" };
 
 // readHMACSecret decodes a secret file's standard base64, surrounding
 // whitespace ignored, to at least 32 bytes, as reference-implementations/README.md
@@ -45,12 +33,8 @@ export function readHMACSecret(encoded: string): Buffer {
   return secret;
 }
 
-export function deriveSessionKey(secret: Uint8Array, sessionID: string): Buffer {
-  return Buffer.from(hkdfSync("sha256", secret, Buffer.alloc(0), Buffer.from(sessionID, "utf8"), 32));
-}
-
 export function signCanonical(secret: Uint8Array, sessionID: string, canonical: string): Buffer {
-  return createHmac("sha256", deriveSessionKey(secret, sessionID)).update(canonical).digest();
+  return createHmac("sha256", deriveSessionKey(secret, sessionID, GO_GUARDIAN_HKDF)).update(canonical).digest();
 }
 
 function clone<T>(value: T): T {
@@ -60,7 +44,7 @@ function clone<T>(value: T): T {
 function signRequest(envelope: JsonObject, secret: Uint8Array, sessionID: string, keyID: string): JsonObject {
   const signed = clone(envelope);
   const params = signed.params as JsonObject;
-  const canonical = canonicalJSON(signed);
+  const canonical = canonicalJson(signed);
   params.signature = {
     algorithm: "HMAC-SHA256",
     value: signCanonical(secret, sessionID, canonical).toString("base64"),
@@ -81,7 +65,7 @@ function verifyResponse(response: JsonRpcResponse, secret: Uint8Array, sessionID
   }
   const unsigned = clone(response) as JsonRpcResponse;
   delete (unsigned[holderName] as JsonObject).signature;
-  const expected = signCanonical(secret, sessionID, canonicalJSON(unsigned));
+  const expected = signCanonical(secret, sessionID, canonicalJson(unsigned));
   const received = Buffer.from(signature.value, "base64");
   if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
     throw new Error("external Guardian response signature does not verify");

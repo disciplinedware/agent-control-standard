@@ -104,8 +104,10 @@ type ModificationsRule =
     };
 
 /** Which argument a tool's policy target lives in, for one intervention
- * point. `default` covers every tool `by_tool` does not name. */
-type PolicyTargetArgument = { default: string; by_tool?: Record<string, string> };
+ * point. `default` covers every tool `by_tool` does not name. `null`, as a
+ * `by_tool` entry or as `default`, names no argument: the manifest's own
+ * policy_target reads the tool. */
+type PolicyTargetArgument = { default?: string | null; by_tool?: Record<string, string | null> };
 
 type InterventionPoint = {
   acs_method: string | null;
@@ -196,7 +198,7 @@ export function resolvePolicyTargetArgument(
   mapping: Mapping,
   point: string,
   toolName: string,
-): string | undefined {
+): string | null | undefined {
   const row = mapping.intervention_points?.[point];
   if (row === undefined) {
     throw new Error(
@@ -211,10 +213,16 @@ export function resolvePolicyTargetArgument(
   }
 
   const named = table.by_tool?.[toolName];
+  if (named === null) {
+    return null;
+  }
   if (typeof named === "string") {
     return named;
   }
 
+  if (table.default === null) {
+    return null;
+  }
   if (typeof table.default !== "string") {
     throw new Error(
       `mapping.yaml's intervention_points.${point}.policy_target_argument names no argument for tool ` +
@@ -293,7 +301,7 @@ function synthesizeModifications(
   verdict: AgtVerdict,
   mapping: Mapping,
   point: string,
-  policyTargetArgument: string | undefined,
+  policyTargetArgument: string | null | undefined,
 ): AcsModifications {
   const rule = mapping.intervention_points[point]?.modifications;
   if (!rule) {
@@ -328,7 +336,7 @@ function synthesizeModifications(
     // exists not to produce: a modification reported applied while the
     // original ships. The Guardian's evaluation catch turns this throw into an
     // honoured deny.
-    if (policyTargetArgument === undefined) {
+    if (policyTargetArgument === undefined || policyTargetArgument === null) {
       throw new Error(
         `mapping.yaml maps this verdict into an ACS parameter override, but its intervention_points row ` +
           `for "${point}" declares no policy_target_argument, so there is no argument for the rewrite to ` +
@@ -438,7 +446,7 @@ export function mapVerdict(
   verdict: AgtVerdict,
   mapping: Mapping,
   point: string,
-  policyTargetArgument: string | undefined,
+  policyTargetArgument: string | null | undefined,
 ): AcsDecision {
   const rule = mapping.verdicts[verdict.decision];
   if (!rule) {

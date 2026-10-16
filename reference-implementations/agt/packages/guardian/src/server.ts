@@ -857,7 +857,7 @@ type SteppedEnvelope = AcsRequestEnvelope & { params: { payload: { tool: { name:
 async function evaluateStep<E extends SteppedEnvelope>(
   raw: unknown,
   envelope: E,
-  assemble: (envelope: E, sourceLabels: IfcLabels, policyTargetArgument: string | undefined) => GuardianSnapshot,
+  assemble: (envelope: E, sourceLabels: IfcLabels, policyTargetArgument: string | null | undefined) => GuardianSnapshot,
   bridge: PolicyBridge<GuardianSnapshot>,
   mapping: Mapping,
   sessionContextStore: SessionContextStore,

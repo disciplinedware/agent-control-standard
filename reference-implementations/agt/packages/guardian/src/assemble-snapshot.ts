@@ -198,7 +198,7 @@ export type AgtPostToolCallSnapshot = {
 export function assemblePreToolCallSnapshot(
   envelope: ToolCallRequestEnvelope,
   sourceLabels: IfcLabels,
-  policyTargetArgument: string | undefined,
+  policyTargetArgument: string | null | undefined,
 ): AgtPreToolCallSnapshot {
   const { payload, request_id } = envelope.params;
 
@@ -229,19 +229,23 @@ export function assemblePreToolCallSnapshot(
     );
   }
 
-  // A tool whose declared policy-target argument is not among its arguments is
-  // a registration fault, not a policy decision. Throwing names the tool and
-  // the argument; leaving the leaf undefined would reach AGT as
-  // runtime_error:path_missing, which reads like a policy decision and says
-  // nothing about which declaration is wrong.
-  if (!Object.hasOwn(args, policyTargetArgument)) {
-    throw new Error(
-      `mapping.yaml reads tool ${JSON.stringify(payload.tool.name)}'s policy target from argument ` +
-        `${JSON.stringify(policyTargetArgument)}, but this call sent no such argument ` +
-        `(it sent: ${Object.keys(args).join(", ") || "none"})`,
-    );
+  // A tool the mapping names as taking no argument (`by_tool: {tool: null}`)
+  // copies none: the manifest's own policy_target addresses the snapshot.
+  if (policyTargetArgument !== null) {
+    // A tool whose declared policy-target argument is not among its arguments is
+    // a registration fault, not a policy decision. Throwing names the tool and
+    // the argument; leaving the leaf undefined would reach AGT as
+    // runtime_error:path_missing, which reads like a policy decision and says
+    // nothing about which declaration is wrong.
+    if (!Object.hasOwn(args, policyTargetArgument)) {
+      throw new Error(
+        `mapping.yaml reads tool ${JSON.stringify(payload.tool.name)}'s policy target from argument ` +
+          `${JSON.stringify(policyTargetArgument)}, but this call sent no such argument ` +
+          `(it sent: ${Object.keys(args).join(", ") || "none"})`,
+      );
+    }
+    args[POLICY_TARGET_LEAF] = args[policyTargetArgument];
   }
-  args[POLICY_TARGET_LEAF] = args[policyTargetArgument];
 
   return {
     // budgets.rego fails closed on a present-but-wrong-typed counter, so

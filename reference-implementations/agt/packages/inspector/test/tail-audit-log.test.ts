@@ -460,6 +460,65 @@ describe("tailAuditLog", () => {
     });
   });
 
+  it.each<[string, AuditEntry]>([
+    [
+      "an approval line",
+      {
+        seq: 1,
+        recorded_at: "2026-08-10T12:00:00.000Z",
+        session_id: "sess-1",
+        method: "steps/toolCallRequest",
+        rpc_id: null,
+        outcome: "approval",
+        approval: { requested_approver: { type: "human", id: "approver-1" }, resolution: "allow-once", decision: "allow" },
+      },
+    ],
+    [
+      "a substituted line",
+      {
+        seq: 1,
+        recorded_at: "2026-08-10T12:00:00.000Z",
+        session_id: "sess-1",
+        method: "steps/agentResponse",
+        rpc_id: null,
+        outcome: "substituted",
+        substituted: { decision: "modify", reason_code: "modify_unsupported" },
+      },
+    ],
+    [
+      "a refused line",
+      {
+        seq: 1,
+        recorded_at: "2026-08-10T12:00:00.000Z",
+        session_id: "sess-1",
+        method: "steps/toolCallRequest",
+        rpc_id: null,
+        outcome: "refused",
+        refused: { reason_code: "requirement:R5", reason: "acp.enabled must be false" },
+      },
+    ],
+    [
+      "a block the host's own posture decided",
+      JSON.parse(entryLine(1, { posture: "deny", posture_source: "host", outcome: "blocked" })) as AuditEntry,
+    ],
+  ])("delivers %s", async (_label, entry) => {
+    await withTempDir(async (_dir, path) => {
+      writeFileSync(path, `${JSON.stringify(entry)}\n`);
+      const controller = new AbortController();
+      const malformed: string[] = [];
+      const tail = tailAuditLog({
+        path,
+        fromStart: true,
+        pollMs: POLL_MS,
+        signal: controller.signal,
+        onMalformedLine: (line) => malformed.push(line),
+      });
+
+      expect(await collect(tail, 1, controller)).toEqual([entry]);
+      expect(malformed).toEqual([]);
+    });
+  });
+
   it.each([
     ["no ungoverned block at all", { outcome: "ungoverned" }],
     ["a tools list holding a non-string", { outcome: "ungoverned", ungoverned: { tool: "read", tools: [7] } }],

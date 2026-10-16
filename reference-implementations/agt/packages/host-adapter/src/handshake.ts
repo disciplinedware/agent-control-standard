@@ -84,6 +84,9 @@ export type HandshakeOptions = {
    * `timeoutMs`; a caller that omits this accepts a Guardian that accepts
    * the connection and never answers hanging indefinitely. */
   timeoutMs?: number;
+  /** The `steps/*` methods this host sends (ClientHello `methods_implemented`).
+   * Omitted means the two tool-call gates. */
+  methodsImplemented?: string[];
 };
 
 /**
@@ -234,7 +237,7 @@ export async function negotiateSessionConfig(
       // shipped hookmap.
       payload: {
         acs_versions_supported: [ACS_VERSION],
-        methods_implemented: ["steps/toolCallRequest", "steps/toolCallResult"],
+        methods_implemented: options.methodsImplemented ?? ["steps/toolCallRequest", "steps/toolCallResult"],
         transports_supported: ["http"],
         provenance_producer: "none",
       },

@@ -274,6 +274,13 @@ export type ApplyFailurePostureInput = {
    * to "delivery", which is every ordinary call site and §6.4's own case.
    */
   stage?: FailureStage;
+  /**
+   * A host that never proceeds without a decision sets `"deny"`: it outranks
+   * the negotiated posture and the ACS default, and the entry records
+   * `posture_source: "host"`. §6.4 lets a deployment fail closed; this is the
+   * host's half of that deployment declaring it.
+   */
+  hostPosture?: "deny";
 };
 
 /**
@@ -307,9 +314,10 @@ export function applyFailurePosture({
   rpcId,
   audit,
   stage = "delivery",
+  hostPosture,
 }: ApplyFailurePostureInput): FailureResolvedAcsDecision {
   const { config: sessionConfig, failure: sessionFailure } = session;
-  const posture = sessionConfig?.on_decision_failure ?? DEFAULT_POSTURE;
+  const posture = hostPosture ?? sessionConfig?.on_decision_failure ?? DEFAULT_POSTURE;
   // Classified BEFORE the resolution is read, because for one kind it decides
   // the resolution. Everything else is the wire's business and the posture's;
   // a refusal is the Guardian's, and a governance tool does not proceed on it
@@ -325,7 +333,8 @@ export function applyFailurePosture({
   // fail open" (negotiated) are different incidents, and the durable record
   // -- not just the ephemeral `reasoning` string below -- has to be able to
   // tell them apart.
-  const postureSource: "negotiated" | "default" = sessionConfig === undefined ? "default" : "negotiated";
+  const postureSource: "host" | "negotiated" | "default" =
+    hostPosture !== undefined ? "host" : sessionConfig === undefined ? "default" : "negotiated";
 
   // §6.4's MUST. Wrapped because the decision must survive a sink that
   // breaks its own totality contract -- the posture is the load-bearing
@@ -353,9 +362,11 @@ export function applyFailurePosture({
   // Honest about where the posture came from: a negotiated deployment
   // choice reads very differently from a session that never got that far.
   const postureOrigin =
-    postureSource === "default"
-      ? `no session was ever negotiated, so the ACS default posture (${DEFAULT_POSTURE}) applies`
-      : "the session's negotiated posture applies";
+    postureSource === "host"
+      ? "this host never proceeds without a decision, whatever was negotiated"
+      : postureSource === "default"
+        ? `no session was ever negotiated, so the ACS default posture (${DEFAULT_POSTURE}) applies`
+        : "the session's negotiated posture applies";
 
   // Never names a Guardian for a request that never reached one: a
   // `host_configuration` failure is this host's own, and an audit trail

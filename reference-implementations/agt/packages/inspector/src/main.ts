@@ -95,14 +95,15 @@ function noteAuditEntry(entry: AuditEntry): void {
   console.log(renderAuditEntry(entry, { color }));
   console.log("");
 
-  // An ungoverned line carries no posture and is not a fail-open proceed, so
-  // it moves neither half of the badge: it is a step nobody asked about, not
-  // a bypass of a decision this deployment wanted made, and folding it into
+  // Only a posture-resolved line moves the badge. An ungoverned line carries
+  // no posture and is not a fail-open proceed, so it moves neither half: it
+  // is a step nobody asked about, not a bypass of a decision this deployment
+  // wanted made, and folding it into
   // `proceeds` would inflate the one number an operator reads to decide
   // whether the Guardian is healthy. It still prints above -- the badge
   // summarises the posture, the stream is where the skips are visible.
   const next: PostureBadgeState =
-    entry.outcome === "ungoverned"
+    entry.outcome !== "proceeded" && entry.outcome !== "blocked"
       ? badgeState
       : { posture: entry.posture, proceeds: badgeState.proceeds + (entry.outcome === "proceeded" ? 1 : 0) };
   if (next.posture !== badgeState.posture || next.proceeds !== badgeState.proceeds) {

@@ -2,7 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJSON, checkExternalGuardian, deriveSessionKey, signCanonical } from "../src/external-guardian.ts";
+import { canonicalJson, deriveSessionKey } from "host-adapter";
+import { checkExternalGuardian, signCanonical } from "../src/external-guardian.ts";
 
 type Vector = { signed: Record<string, unknown>; signing_input: string };
 type Vectors = {
@@ -18,13 +19,13 @@ describe("the external Guardian signer", () => {
   const secret = Buffer.from(vectors.ikm_hex, "hex");
 
   it("matches the Go Guardian's independent JCS and HKDF vectors", () => {
-    expect(deriveSessionKey(secret, vectors.session_id).toString("hex")).toBe(vectors.session_key_hex);
+    expect(deriveSessionKey(secret, vectors.session_id, { salt: "", infoPrefix: "", sessionIdEncoding: "utf8" }).toString("hex")).toBe(vectors.session_key_hex);
     for (const [holderName, vector] of [["params", vectors.request], ["result", vectors.response]] as const) {
       const unsigned = structuredClone(vector.signed);
       const holder = unsigned[holderName] as Record<string, unknown>;
       const signature = holder.signature as { value: string };
       delete holder.signature;
-      const canonical = canonicalJSON(unsigned);
+      const canonical = canonicalJson(unsigned);
       expect(canonical).toBe(vector.signing_input);
       expect(signCanonical(secret, vectors.session_id, canonical).toString("base64")).toBe(signature.value);
     }
@@ -45,7 +46,7 @@ describe("the external Guardian wire checks", () => {
       const params = request.params as Record<string, unknown>;
       const metadata = params.metadata as { session_id: string };
       const response = { jsonrpc: "2.0", id: request.id, [holderName]: holder };
-      const signature = signCanonical(secret, metadata.session_id, canonicalJSON(response)).toString("base64");
+      const signature = signCanonical(secret, metadata.session_id, canonicalJson(response)).toString("base64");
       holder.signature = { algorithm: "HMAC-SHA256", key_id: keyID, value: signature };
       return response;
     };

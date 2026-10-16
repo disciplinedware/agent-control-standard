@@ -107,15 +107,16 @@ type PostureResolvedAuditEntry = AuditEntryIdentity & {
    * write failed, so it leaves no entry to read.
    */
   outcome: "proceeded" | "blocked";
-  /** The posture in force -- negotiated, or the ACS default when nothing was. */
+  /** The posture in force: the host's, the negotiated one, or the ACS default. */
   posture: "proceed" | "deny";
-  /** Whether `posture` was negotiated at handshake or is the ACS default
-   * because no handshake ever completed. The `reasoning` string a human
-   * reads in a transcript is ephemeral; this field carries the same
+  /** Whether `posture` is the host's own fail-closed setting, was
+   * negotiated at handshake, or is the ACS default because no handshake ever
+   * completed. The `reasoning` string a human reads in a transcript is
+   * ephemeral; this field carries the same
    * distinction into the durable record, because "the guardian was down
    * for this whole session" and "this deployment chose to fail open" are
    * different incidents and the audit log is where that has to survive. */
-  posture_source: "negotiated" | "default";
+  posture_source: "host" | "negotiated" | "default";
   /**
    * What went wrong with THIS step, classified.
    *
@@ -204,7 +205,49 @@ type UngovernedAuditEntry = AuditEntryIdentity & {
   ungoverned: { tool: string; tools: string[] };
 };
 
-export type AuditEntry = PostureResolvedAuditEntry | UngovernedAuditEntry;
+/**
+ * An `ask` this host put to a person, and how that person, or the wait,
+ * resolved it. ACS v0.1 has no wire method that returns the answer to the
+ * Guardian, so the host's log is the only record of it.
+ */
+type ApprovalAuditEntry = AuditEntryIdentity & {
+  outcome: "approval";
+  approval: {
+    /** `ask_details.approver` as the Guardian named it: whom the host asked,
+     * not necessarily who answered, which a host may not be told. */
+    requested_approver: { type: string; id: string };
+    /** The host's own answer: its decision word, or why none came. */
+    resolution: string;
+    /** What the step became. */
+    decision: "allow" | "deny";
+  };
+};
+
+/**
+ * A decision that arrived and that this gate cannot carry out as sent,
+ * blocked instead: §6.5's audit event for a `modify` the host cannot apply
+ * (`reason_code: "modify_unsupported"`), and the same record for an `ask` or
+ * `defer` the gate has no way to hold open.
+ */
+type SubstitutedAuditEntry = AuditEntryIdentity & {
+  outcome: "substituted";
+  substituted: { decision: string; reason_code: string };
+};
+
+/**
+ * A step the host refused before any envelope was built, because a condition
+ * the host's guarantees rest on does not hold: a requirement of the host's own
+ * deployment failed, or the step came from a run the host never admitted. No
+ * Guardian was asked and no posture was consulted, so neither arm above fits.
+ * `reason_code` is machine-readable (for example `requirement:R5`), `reason`
+ * says why in words.
+ */
+type RefusedAuditEntry = AuditEntryIdentity & {
+  outcome: "refused";
+  refused: { reason_code: string; reason: string };
+};
+
+export type AuditEntry = PostureResolvedAuditEntry | UngovernedAuditEntry | ApprovalAuditEntry | SubstitutedAuditEntry | RefusedAuditEntry;
 
 /** `Omit` over a union collapses it to the keys its arms share, which would
  * silently erase both arms' own fields. Distributed, so each arm keeps them. */

@@ -52,7 +52,7 @@ Each part has its own README that says how to start it.
 |---|---|---|
 | Host shim, Claude Code | [`hosts/claude-code/`](hosts/claude-code/README.md) | Runs as a hook subprocess. Reads the hook payload on stdin. Writes the decision on stdout. |
 | Host shim, OpenCode | [`hosts/opencode/`](hosts/opencode/README.md) | Runs as an in-process plugin. Mutates the live tool call object or throws. |
-| Host adapter | [`packages/host-adapter/`](packages/host-adapter/README.md) | Builds envelopes, negotiates the session, applies decisions, applies the failure posture, writes the audit log. Shared by both shims. |
+| Host adapter | [`packages/host-adapter/`](packages/host-adapter/README.md) | Builds envelopes, negotiates the session, signs envelopes and verifies answers, applies decisions, applies the failure posture, writes the audit log. Shared by every shim. |
 | Guardian | [`packages/guardian/`](packages/guardian/README.md) | Serves `POST /acs`. Validates envelopes. Assembles AGT policy input. Maps AGT verdicts to ACS decisions. Keeps session state. Records every envelope. |
 | AGT bridge | [`packages/agt-bridge/`](packages/agt-bridge/README.md) | Constructs the AGT SDK runtime against the pinned policy bundle. Publishes the bundled OPA binary to the process environment. |
 | Inspector | [`packages/inspector/`](packages/inspector/README.md) | Tails the Guardian's logs and renders each envelope, decision, audit entry and session chain entry. |
@@ -75,7 +75,7 @@ Each part has its own README that says how to start it.
 | Five dispositions | `allow`, `deny` and `modify` are complete. `ask` is sent without `ask_details`, so it fails the response schema. `defer` is never produced. |
 | SessionContext with published `chain_hash` | The Guardian keeps a hash chain per session and writes it to a log. It does not put `chain_hash` on any response. |
 | Replay protection | Not implemented. No timestamp window check. No duplicate `request_id` check. |
-| Baseline HMAC-SHA256 signature | Not implemented. Nothing signs or verifies an envelope. |
+| Baseline HMAC-SHA256 signature | Host side only. The host adapter signs requests and verifies answers when a shim gives it a key, and the OpenClaw plugin does. The Guardian in this tree neither verifies nor signs. |
 | Decision honoring and `on_decision_failure` | Implemented on both hosts. Every fail-open proceed is written to the audit log. |
 | Liveness, `system/ping` | Not implemented. |
 | Wrapped MCP, `protocols/MCP/*` | Not implemented. |
@@ -435,7 +435,7 @@ The audit log and the envelope log cannot be joined on `session_id`. The audit l
 
 ## The scenarios the tests check
 
-The suite has 69 test files. Most tests use a real Guardian, the host shim, and the pinned policy bundle.
+The suite has 73 test files. Most tests use a real Guardian, the host shim, and the pinned policy bundle.
 The scenarios below are grouped by the behavior under test. Read each test file for the exact assertions.
 
 The Go Guardian replays this Guardian's recorded answers. A change to a path in `DecidingPaths` (`../agt-go/internal/tscases/tscases.go`) needs a new recording: run `scripts/record-ts-cases.sh` in `../agt-go`. If the new answers differ, the Go Guardian is changed to match them, or `../agt-go/docs/differences.md` records the difference. Recording needs Go and Bun. A change to `agt_ref` in `agt.lock` also needs the same commit in `../agt-go/agt-native.lock`, where the Go build pins the AGT it compiles.

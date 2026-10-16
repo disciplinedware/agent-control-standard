@@ -46,6 +46,7 @@
  * Guardian only over the wire, at whatever `url` the caller gives.
  */
 import type { AcsRequestEnvelope } from "./build-envelope.ts";
+import { SignatureInvalidError, signRequest, verifyResponse, type SigningKey } from "./signature.ts";
 import type { AcsDecision } from "./decision-message.ts";
 
 /**
@@ -167,7 +168,7 @@ export type GuardianClient = {
    * this method are ACS's vocabulary, and JSON-RPC is the transport it happens to
    * travel over (see JsonRpcRequest).
    */
-  requestDecision(envelope: AcsRequestEnvelope, options?: PostOptions): Promise<DecisionOrFailure>;
+  requestDecision(envelope: AcsRequestEnvelope | JsonRpcRequest, options?: PostOptions): Promise<DecisionOrFailure>;
   /**
    * The wire primitive: POSTs `envelope` as JSON, parses the JSON-RPC
    * response, and returns it once it is confirmed to answer this request --
@@ -190,16 +191,55 @@ export type GuardianClient = {
   post(envelope: JsonRpcRequest, options?: PostOptions): Promise<JsonRpcResponse>;
 };
 
+export type CreateGuardianClientOptions = {
+  /**
+   * Signs every request and authenticates every answer under §10 before
+   * anything reads it: the answer must carry exactly one of `result` and
+   * `error`, signed under this session's key and `key_id`, and a decision
+   * must name this request's `request_id`. An answer that fails any of these
+   * is a delivery failure, never a decision. That includes an unsigned
+   * error, which a Guardian sends to a request it could not authenticate:
+   * its code is not acted on.
+   */
+  signingKey?: SigningKey;
+};
+
+/** Throws unless `response` is one signed member under `key`. */
+function assertAuthentic(response: JsonRpcResponse, sessionId: string, key: SigningKey): void {
+  if ((response.result === undefined) === (response.error === undefined)) {
+    throw new SignatureInvalidError("the answer carries both or neither of result and error, so no one member can be authenticated");
+  }
+  if (response.error !== undefined && (response.error as { signature?: unknown }).signature === undefined) {
+    throw new SignatureInvalidError(
+      `the Guardian answered with unsigned error ${String(response.error.code)} (${String(response.error.message)}), which this host does not act on`,
+    );
+  }
+  verifyResponse(response as unknown as Record<string, unknown>, sessionId, key);
+}
+
+function sessionIdOf(envelope: JsonRpcRequest): string {
+  const sessionId = (envelope.params.metadata as { session_id?: unknown } | undefined)?.session_id;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw new Error("guardianClient.post: a signed request needs params.metadata.session_id to derive its key");
+  }
+  return sessionId;
+}
+
 /** Binds a Guardian's ACS endpoint and returns the client role for it. */
-export function createGuardianClient(url: string): GuardianClient {
+export function createGuardianClient(url: string, { signingKey }: CreateGuardianClientOptions = {}): GuardianClient {
   async function post(envelope: JsonRpcRequest, options: PostOptions = {}): Promise<JsonRpcResponse> {
     const { timeoutMs } = options;
+    const sessionId = signingKey === undefined ? undefined : sessionIdOf(envelope);
+    const outbound =
+      signingKey === undefined
+        ? envelope
+        : signRequest(envelope as unknown as Parameters<typeof signRequest>[0], signingKey);
     let response: JsonRpcResponse;
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(envelope),
+        body: JSON.stringify(outbound),
         // §6.4: the negotiated timeout bounds every failure mode. An
         // unambiguous failure (a refused connection) still rejects
         // immediately -- fetch does not wait out the clock for those.
@@ -221,6 +261,10 @@ export function createGuardianClient(url: string): GuardianClient {
       throw error;
     }
 
+    if (signingKey !== undefined && sessionId !== undefined) {
+      assertAuthentic(response, sessionId, signingKey);
+    }
+
     // An error the Guardian could not address, let through to the caller
     // rather than thrown away by the correlation check below. A JSON-RPC
     // response MUST carry `id: null` when the request's id could not be
@@ -231,11 +275,11 @@ export function createGuardianClient(url: string): GuardianClient {
     // a plain delivery failure: a `-32700` could not reach the classifier at
     // all, and under a `proceed` posture the step ran.
     //
-    // Narrow deliberately, to an `id: null` that also carries an `error`. A
-    // null id on a RESULT is a genuine correlation failure -- a Guardian
+    // Narrow deliberately, to an `id: null` that carries an `error` and no
+    // `result`. A null id on a RESULT is a genuine correlation failure -- a Guardian
     // answering a decision it cannot say whose it is -- and that still throws
     // below, which is the whole reason the check exists.
-    if (response.id === null && response.error !== undefined) {
+    if (response.id === null && response.error !== undefined && response.result === undefined) {
       return response;
     }
 
@@ -258,7 +302,7 @@ export function createGuardianClient(url: string): GuardianClient {
   return {
     post,
 
-    async requestDecision(envelope: AcsRequestEnvelope, options: PostOptions = {}): Promise<DecisionOrFailure> {
+    async requestDecision(envelope: AcsRequestEnvelope | JsonRpcRequest, options: PostOptions = {}): Promise<DecisionOrFailure> {
       let response: JsonRpcResponse;
       try {
         response = await post(envelope, options);
@@ -278,6 +322,9 @@ export function createGuardianClient(url: string): GuardianClient {
       // arriving `deny` must be honoured -- answering it with a failure
       // instead would let a delivery-failure rule overrule a policy decision.
       const arrived = response.result as AcsDecision | undefined;
+      if (signingKey !== undefined && arrived !== undefined && arrived.request_id !== envelope.params.request_id) {
+        return { decisionArrived: false, failure: new GuardianResultCorrelationError(envelope.params.request_id, arrived.request_id) };
+      }
       if (typeof arrived?.decision === "string") {
         return { decisionArrived: true, decision: arrived };
       }

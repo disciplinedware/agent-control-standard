@@ -487,6 +487,26 @@ describe("which argument a tool's policy target is read from", () => {
     expect(resolvePolicyTargetArgument(shipped, "pre_tool_call", "Bash")).toBe("command");
   });
 
+  it("answers null for a tool the table names as taking no argument, whatever the default", () => {
+    const table = structuredClone(shipped);
+    table.intervention_points.pre_tool_call!.policy_target_argument!.by_tool = { list_all: null };
+    expect(resolvePolicyTargetArgument(table, "pre_tool_call", "list_all")).toBeNull();
+    expect(resolvePolicyTargetArgument(table, "pre_tool_call", "lookup")).toBe("command");
+  });
+
+  it("answers null for every unnamed tool under default: null, and still the argument by_tool names", () => {
+    const table = structuredClone(shipped);
+    table.intervention_points.pre_tool_call!.policy_target_argument = { default: null, by_tool: { lookup: "subject_id" } };
+    expect(resolvePolicyTargetArgument(table, "pre_tool_call", "list_all")).toBeNull();
+    expect(resolvePolicyTargetArgument(table, "pre_tool_call", "lookup")).toBe("subject_id");
+  });
+
+  it("refuses a tool the table names no argument for, with no default", () => {
+    const table = structuredClone(shipped);
+    table.intervention_points.pre_tool_call!.policy_target_argument = { by_tool: { lookup: "subject_id" } };
+    expect(() => resolvePolicyTargetArgument(table, "pre_tool_call", "list_all")).toThrow("declares no usable");
+  });
+
   it("falls back to the default for a tool the table does not name", () => {
     expect(resolvePolicyTargetArgument(shipped, "pre_tool_call", "SomeToolNobodyRegistered")).toBe("command");
   });

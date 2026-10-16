@@ -432,4 +432,57 @@ describe("renderAuditEntry", () => {
     expect(line).toContain("[(none)]");
     expect(line).toContain("(no method)");
   });
+
+  it("renders an approval with the approver and how it resolved, and no posture", () => {
+    const line = renderAuditEntry(
+      {
+        seq: 4,
+        recorded_at: "2026-08-10T12:00:03.000Z",
+        session_id: "sess-1",
+        method: "steps/toolCallRequest",
+        rpc_id: null,
+        outcome: "approval",
+        approval: { requested_approver: { type: "human", id: "approver-1" }, resolution: "deny", decision: "deny" },
+      },
+      { color: false },
+    );
+    expect(line).toContain("APPROVAL");
+    expect(line).toContain("requested_approver=human:approver-1  resolution=deny  decision=deny");
+    expect(line).not.toContain("posture=");
+  });
+
+  it("renders a substitution with the decision and its reason code", () => {
+    const line = renderAuditEntry(
+      {
+        seq: 5,
+        recorded_at: "2026-08-10T12:00:04.000Z",
+        session_id: "sess-1",
+        method: "steps/agentResponse",
+        rpc_id: null,
+        outcome: "substituted",
+        substituted: { decision: "modify", reason_code: "modify_unsupported" },
+      },
+      { color: false },
+    );
+    expect(line).toContain("SUBSTITUTED");
+    expect(line).toContain("substituted=modify: modify_unsupported");
+  });
+
+  it("renders a refusal with its reason code and reason, as a denial", () => {
+    const line = renderAuditEntry(
+      {
+        seq: 6,
+        recorded_at: "2026-08-10T12:00:05.000Z",
+        session_id: "sess-1",
+        method: "steps/toolCallRequest",
+        rpc_id: null,
+        outcome: "refused",
+        refused: { reason_code: "run_not_admitted", reason: "the run never passed before_agent_run" },
+      },
+      { color: false },
+    );
+    expect(line).toContain("REFUSED");
+    expect(line).toContain("refused=run_not_admitted: the run never passed before_agent_run");
+    expect(line).not.toContain("posture=");
+  });
 });

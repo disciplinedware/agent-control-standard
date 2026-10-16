@@ -6,6 +6,10 @@
 #   2. The conformance harness (packages/conformance), which publishes a
 #      machine-checked ACS-to-AGT mapping table from this same file.
 #
+# The Go Guardian (reference-implementations/agt-go) reads this file too, with
+# one difference: it reads field_synthesis.ask_details, which the TypeScript
+# Guardian has no ASK path for.
+#
 # Any change to the intervention_points / verdict / field_synthesis tables
 # below is a behavior change for both consumers. mapVerdict must implement
 # exactly this table — no verdict names, decisions, field derivations or
@@ -70,7 +74,11 @@ intervention_points:
     # key the tool has no argument for -- while url, still carrying the secret,
     # shipped untouched. One entry read twice cannot do that.
     #
-    # `default` is what an unlisted tool gets. A tool listed here that
+    # `default` is what an unlisted tool gets. `null`, for one tool in
+    # by_tool or as `default` for every unlisted tool, names no argument: the
+    # manifest's own policy_target reads the tool, and a transform of it is
+    # refused. A tool neither listed nor covered by a `default`, or a gate
+    # with no table, is refused, by both Guardians. A tool listed here that
     # policy/manifest.yaml does not register is a failing case in
     # test/path-dialects.test.ts.
     policy_target_argument:
@@ -186,6 +194,15 @@ field_synthesis:
       source: verdict.reason
     policy_id:
       literal: agt_stock
+  # Whom an ASK goes to, chosen by the escalate verdict's reason: the policy,
+  # not the endpoint, decides who approves. A reason with no entry is answered
+  # DENY approver_unavailable, and the types listed here are the Guardian's
+  # approver_types_supported. Each entry is an ask-details.json approver:
+  #   <reason>: {type: human|agent|service, id: <string>, endpoint?: <url>, auth?: {method: <string>}}
+  # Empty here: the stock bundle never escalates.
+  ask_details:
+    approver:
+      by_reason: {}
 # modifications is NOT here: it lives under each intervention_points row above,
 # because it is the one field whose synthesis depends on which payload the gate
 # is editing. See the two rows there.

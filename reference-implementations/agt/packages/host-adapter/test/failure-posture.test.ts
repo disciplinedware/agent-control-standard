@@ -26,8 +26,8 @@ function recordingSink(): { sink: AuditSink; events: PostureAuditEvent[] } {
         // Checked rather than cast: if this module ever starts writing the
         // other arm, that is a change to what it records and it should fail
         // here loudly rather than be narrowed away by an assertion.
-        if (e.outcome === "ungoverned") {
-          throw new Error(`applyFailurePosture wrote an ungoverned entry: ${JSON.stringify(e)}`);
+        if (e.outcome !== "proceeded" && e.outcome !== "blocked") {
+          throw new Error(`applyFailurePosture wrote a non-posture entry: ${JSON.stringify(e)}`);
         }
         events.push(e);
         return true;
@@ -63,6 +63,25 @@ const SESSION = (posture: "proceed" | "deny" | undefined, failure?: unknown): Re
 });
 
 const CALL = { sessionId: "sess-1", method: "steps/toolCallRequest", rpcId: "req-1" };
+
+describe("applyFailurePosture — a host that never proceeds without a decision", () => {
+  it.each([
+    ["negotiated_proceed", SESSION("proceed")],
+    ["nothing_negotiated", SESSION(undefined)],
+  ])("blocks over %s and records the host as the posture's source", (_name, session) => {
+    const { sink, events } = recordingSink();
+    const decision = applyFailurePosture({
+      failure: new GuardianTimeoutError(5000),
+      session,
+      audit: sink,
+      hostPosture: "deny",
+      ...CALL,
+    });
+    expect(decision.decision).toBe("deny");
+    expect(decision.reasoning).toContain("this host never proceeds without a decision");
+    expect(events).toEqual([expect.objectContaining({ posture: "deny", posture_source: "host", outcome: "blocked" })]);
+  });
+});
 
 describe("applyFailurePosture — the negotiated posture", () => {
   it("proceeds under the negotiated proceed posture", () => {

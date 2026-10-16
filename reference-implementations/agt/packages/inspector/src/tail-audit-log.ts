@@ -76,7 +76,7 @@ type AuditEntryIdentity = {
  * arrived -- §6.4's own case. */
 type PostureResolvedAuditEntry = AuditEntryIdentity & {
   posture: "proceed" | "deny";
-  posture_source: "negotiated" | "default";
+  posture_source: "host" | "negotiated" | "default";
   outcome: "proceeded" | "blocked";
   failure: { kind: string; message: string };
   /** Present only when establishing the session's negotiated configuration
@@ -94,10 +94,28 @@ type UngovernedAuditEntry = AuditEntryIdentity & {
   ungoverned: { tool: string; tools: string[] };
 };
 
-/** One line of the audit log, as written by the audit sink on the
- * posture-negotiating side of the wire. A union, because the two kinds of
- * line share nothing but their identity fields; narrow on `outcome`. */
-export type AuditEntry = PostureResolvedAuditEntry | UngovernedAuditEntry;
+/** An `ask` the writer put to a person, and how it resolved. */
+type ApprovalAuditEntry = AuditEntryIdentity & {
+  outcome: "approval";
+  approval: { requested_approver: { type: string; id: string }; resolution: string; decision: "allow" | "deny" };
+};
+
+/** A decision the writer's gate could not carry out as sent, blocked instead. */
+type SubstitutedAuditEntry = AuditEntryIdentity & {
+  outcome: "substituted";
+  substituted: { decision: string; reason_code: string };
+};
+
+/** One line of the audit log, as written by the audit sink on the host side
+ * of the wire. A union, because the kinds of line share nothing but their
+ * identity fields; narrow on `outcome`. */
+/** A step the writer refused before any envelope was built. */
+type RefusedAuditEntry = AuditEntryIdentity & {
+  outcome: "refused";
+  refused: { reason_code: string; reason: string };
+};
+
+export type AuditEntry = PostureResolvedAuditEntry | UngovernedAuditEntry | ApprovalAuditEntry | SubstitutedAuditEntry | RefusedAuditEntry;
 
 export type TailAuditLogOptions = {
   path: string;
@@ -149,9 +167,25 @@ function isAuditEntryShape(value: unknown): value is AuditEntry {
   if (candidate.outcome === "ungoverned") {
     return isUngovernedShape(candidate.ungoverned);
   }
+  if (candidate.outcome === "approval") {
+    const approval = candidate.approval as Record<string, unknown> | undefined;
+    return (
+      isStringRecord(approval, ["resolution"]) &&
+      isStringRecord(approval?.requested_approver, ["type", "id"]) &&
+      (approval?.decision === "allow" || approval?.decision === "deny")
+    );
+  }
+  if (candidate.outcome === "substituted") {
+    return isStringRecord(candidate.substituted, ["decision", "reason_code"]);
+  }
+  if (candidate.outcome === "refused") {
+    return isStringRecord(candidate.refused, ["reason_code", "reason"]);
+  }
   return (
     (candidate.posture === "proceed" || candidate.posture === "deny") &&
-    (candidate.posture_source === "negotiated" || candidate.posture_source === "default") &&
+    (candidate.posture_source === "host" ||
+      candidate.posture_source === "negotiated" ||
+      candidate.posture_source === "default") &&
     (candidate.outcome === "proceeded" || candidate.outcome === "blocked") &&
     isFailureShape(candidate.failure) &&
     // Optional, so absent is valid -- but a present one is checked as
@@ -172,6 +206,14 @@ function isUngovernedShape(value: unknown): value is { tool: string; tools: stri
     typeof candidate.tool === "string" &&
     Array.isArray(candidate.tools) &&
     candidate.tools.every((tool) => typeof tool === "string")
+  );
+}
+
+function isStringRecord(value: unknown, keys: string[]): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    keys.every((key) => typeof (value as Record<string, unknown>)[key] === "string")
   );
 }
 

@@ -322,8 +322,14 @@ export function renderPostureBadge(state: PostureBadgeState, options: RenderOpti
  */
 export function renderAuditEntry(entry: AuditEntry, options: RenderOptions = {}): string {
   const color = options.color ?? false;
-  const outcomeLabel = entry.outcome === "blocked" ? "BLOCKED" : entry.outcome === "proceeded" ? "PROCEEDED" : "UNGOVERNED";
-  const outcomeColor = entry.outcome === "blocked" ? RED : YELLOW;
+  const outcomeLabel = entry.outcome.toUpperCase();
+  const outcomeColor =
+    entry.outcome === "blocked" ||
+    entry.outcome === "substituted" ||
+    entry.outcome === "refused" ||
+    (entry.outcome === "approval" && entry.approval.decision === "deny")
+      ? RED
+      : YELLOW;
   const id = entry.rpc_id === null ? "(unpaired)" : `id=${entry.rpc_id}`;
   // Same fallback renderEnvelopeLogEntry uses for a log line with no method,
   // and for the same reason: an entry written before any request could be built
@@ -336,7 +342,10 @@ export function renderAuditEntry(entry: AuditEntry, options: RenderOptions = {})
   // chose to proceed", which is not what happened. The writer does not carry
   // the field on that arm at all, so this is the type being honest rather
   // than this renderer choosing to omit something it was given.
-  const postureField = entry.outcome === "ungoverned" ? "" : `posture=${entry.posture}/${entry.posture_source}  `;
+  const postureField =
+    entry.outcome === "proceeded" || entry.outcome === "blocked"
+      ? `posture=${entry.posture}/${entry.posture_source}  `
+      : "";
   const header = paint(
     `── #${entry.seq}  ${clockOf(entry.recorded_at)}  ${outcomeLabel}  ${method}  ${id}  ` +
       `${postureField}audit_session=${entry.session_id}`,
@@ -352,6 +361,20 @@ export function renderAuditEntry(entry: AuditEntry, options: RenderOptions = {})
     return [header, paint(`ungoverned=${entry.ungoverned.tool}: not in this gate's tools [${declared}]`, DIM, color)].join(
       "\n",
     );
+  }
+
+  if (entry.outcome === "approval") {
+    const { requested_approver, resolution, decision } = entry.approval;
+    return [
+      header,
+      paint(`requested_approver=${requested_approver.type}:${requested_approver.id}  resolution=${resolution}  decision=${decision}`, DIM, color),
+    ].join("\n");
+  }
+  if (entry.outcome === "substituted") {
+    return [header, paint(`substituted=${entry.substituted.decision}: ${entry.substituted.reason_code}`, DIM, color)].join("\n");
+  }
+  if (entry.outcome === "refused") {
+    return [header, paint(`refused=${entry.refused.reason_code}: ${entry.refused.reason}`, DIM, color)].join("\n");
   }
 
   const failureLine = paint(`failure=${entry.failure.kind}: ${entry.failure.message}`, DIM, color);

@@ -74,6 +74,12 @@ describe("assemblePreToolCallSnapshot", () => {
     expect(snapshot.tool_call.args).toEqual({ command: "rm -rf /", [POLICY_TARGET_LEAF]: "rm -rf /" });
   });
 
+  it("copies no leaf for a tool the mapping names as taking no argument", () => {
+    const envelope = makeEnvelope({ toolName: "list_all", args: {} });
+    const snapshot = assemblePreToolCallSnapshot(envelope, EMPTY_SOURCE_LABELS, null);
+    expect(snapshot.tool_call.args).toEqual({});
+  });
+
   // AGT's stock pattern check reads input.policy_target.value and
   // requires is_string. A surviving {value:...} wrapper (or a non-string)
   // makes the check silently never fire, and everything is allowed.

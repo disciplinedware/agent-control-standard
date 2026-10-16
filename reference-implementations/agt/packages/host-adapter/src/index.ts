@@ -21,6 +21,7 @@ export {
   GuardianResponseMismatchError,
   GuardianResultCorrelationError,
   GuardianTimeoutError,
+  type CreateGuardianClientOptions,
   type DecisionOrFailure,
   type GuardianClient,
   type JsonRpcRequest,
@@ -127,6 +128,17 @@ export {
   type HostOutputLocation,
 } from "./result-output.ts";
 export { validateDecision, type ValidateDecisionContext } from "./validate-decision.ts";
+export {
+  canonicalJson,
+  deriveSessionKey,
+  HMAC_SHA256,
+  signRequest,
+  SignatureInvalidError,
+  verifyResponse,
+  type HkdfParameters,
+  type Signature,
+  type SigningKey,
+} from "./signature.ts";
 // The one shared surface for JavaScript's prototype-machinery names, and
 // the value-tree walker that checks a rendered value against them at any
 // depth -- exported so a host applier (hosts/opencode/apply-opencode-output.ts
