@@ -65,6 +65,7 @@ type fileConfig struct {
 	} `koanf:"audit"`
 	Protocol struct {
 		OnDecisionFailure string        `koanf:"on_decision_failure"`
+		MethodsEvaluated  []string      `koanf:"methods_evaluated"`
 		DecisionTimeout   time.Duration `koanf:"decision_timeout"`
 		SkewWindow        time.Duration `koanf:"skew_window"`
 	} `koanf:"protocol"`
@@ -85,6 +86,7 @@ type config struct {
 	path              string
 	host, port        string
 	posture           acs.FailurePosture
+	evaluatedHooks    []string
 	envelopeLog       string
 	eventLog          string
 	auditRotation     guardian.JSONLRotation
@@ -210,7 +212,7 @@ func loadConfig(args, environ []string) (config, error) {
 
 	c := config{
 		path: absConfigPath, host: raw.Server.Host, port: raw.Server.Port,
-		posture:     acs.FailurePosture(raw.Protocol.OnDecisionFailure),
+		posture: acs.FailurePosture(raw.Protocol.OnDecisionFailure), evaluatedHooks: raw.Protocol.MethodsEvaluated,
 		envelopeLog: envelopeLog, eventLog: eventLog,
 		auditRotation:   guardian.JSONLRotation{MaxFileBytes: raw.Audit.MaxFileBytes, MaxFiles: raw.Audit.MaxFiles},
 		storageProvider: raw.Storage.Provider,
@@ -381,6 +383,7 @@ func run(args, environ []string) error {
 		AskSubstitution: c.askSubstitution,
 		DecisionTimeout: c.decisionTimeout, SkewWindow: c.skewWindow,
 		OnDecisionFailure: c.posture, MaxBodyBytes: c.maxBodyBytes,
+		EvaluatedHooks: c.evaluatedHooks,
 	})
 	if err != nil {
 		return err

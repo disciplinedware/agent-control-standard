@@ -40,6 +40,8 @@ const (
 	ResponseEnvelope = "response-envelope.json"
 	ContextEntry     = "context-entry.json"
 	ServerHello      = "handshake.json#/$defs/ServerHello"
+	// AskApprover is the approver an ASK names, ask_details.approver.
+	AskApprover = "ask-details.json#/properties/approver"
 )
 
 // payloadSchemas maps each method to the schema its params.payload is
@@ -134,7 +136,7 @@ func Load() (*Registry, error) {
 		r.byRef[ref] = s
 		return s, nil
 	}
-	for _, ref := range []string{RequestEnvelope, ResponseEnvelope, ContextEntry, ServerHello} {
+	for _, ref := range []string{RequestEnvelope, ResponseEnvelope, ContextEntry, ServerHello, AskApprover} {
 		if _, err := compile(ref); err != nil {
 			return nil, err
 		}

@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/guardian"
@@ -73,6 +75,42 @@ func TestPolicyPathStaysInsideDeploymentDir(t *testing.T) {
 			}
 			if got != want {
 				t.Fatalf("policyPath(%q) = %q, want %q", value, got, want)
+			}
+		})
+	}
+}
+
+// protocol.methods_evaluated reaches the Guardian's EvaluatedHooks; unset, it
+// stays nil, which evaluates every native hook.
+func TestConfigMethodsEvaluated(t *testing.T) {
+	stock, err := os.ReadFile("../../guardian.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "hmac-secret")
+	if err := os.WriteFile(secretFile, []byte(base64.StdEncoding.EncodeToString([]byte("01234567890123456789012345678901"))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		methods string
+		want    []string
+	}{
+		"unset":  {"", nil},
+		"listed": {"  methods_evaluated: [steps/userMessage, steps/toolCallRequest]\n", []string{"steps/userMessage", "steps/toolCallRequest"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			configPath := filepath.Join(dir, name+".yaml")
+			body := strings.Replace(string(stock), "protocol:\n", "protocol:\n"+tc.methods, 1)
+			if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := loadConfig([]string{"--config", configPath}, []string{"ACS__SECURITY__HMAC_SECRET_FILE=" + secretFile})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(c.evaluatedHooks, tc.want) {
+				t.Fatalf("evaluated hooks %v, want %v", c.evaluatedHooks, tc.want)
 			}
 		})
 	}

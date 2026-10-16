@@ -5,7 +5,7 @@
 // The package holds one projection and evaluates through one of two
 // evaluators. The projection is what the TypeScript Guardian does around
 // AGT: it keeps the session's policy state, assembles AGT's snapshot at the
-// pre_tool_call and post_tool_call intervention points, dispatches the
+// pre_tool_call, post_tool_call and output intervention points, dispatches the
 // egress annotator the reference's manifest declares, turns each verdict
 // into an ACS decision through the reference's mapping.yaml, and handles
 // Ask, tool aliases and wrapped MCP calls. The evaluator executes AGT's
@@ -41,11 +41,9 @@ const reasonMCPCallPending = "mcp_call_pending"
 const DefaultAskTimeout = 5 * time.Minute
 
 // Options are what a deployment chooses beyond the manifest and the mapping.
+// Whom an Ask goes to is the mapping's field_synthesis.ask_details, chosen by
+// the escalate verdict's reason.
 type Options struct {
-	// Approver is who resolves AGT's escalate verdict, sent as an ACS Ask.
-	// AGT's manifest names no approver for ACS, so without one an escalate
-	// is answered DENY with reason code approver_unavailable.
-	Approver *acs.Approver
 	// AskTimeout is an Ask's timeout; zero means DefaultAskTimeout.
 	AskTimeout time.Duration
 	// ToolAliases maps host tool names to manifest tool names before policy
@@ -71,8 +69,6 @@ func New(fsys fs.FS, mappingPath string, evaluator Evaluator, opts Options) (*En
 		return nil, errors.New("agtbridge: AskTimeout is at least one second, the smallest timeout_seconds ask-details.json admits")
 	case opts.AskTimeout%time.Second != 0:
 		return nil, errors.New("agtbridge: AskTimeout must be a whole number of seconds")
-	case opts.Approver != nil && (opts.Approver.Type == "" || opts.Approver.ID == ""):
-		return nil, errors.New("agtbridge: an Approver needs a type and an id")
 	}
 	for source, target := range opts.ToolAliases {
 		if strings.TrimSpace(source) == "" || strings.TrimSpace(target) == "" {
@@ -81,22 +77,6 @@ func New(fsys fs.FS, mappingPath string, evaluator Evaluator, opts Options) (*En
 	}
 	if opts.AskTimeout == 0 {
 		opts.AskTimeout = DefaultAskTimeout
-	}
-	if opts.Approver != nil {
-		approver := *opts.Approver
-		if approver.Endpoint != nil {
-			endpoint := *approver.Endpoint
-			approver.Endpoint = &endpoint
-		}
-		if approver.Auth != nil {
-			auth := *approver.Auth
-			if auth.Method != nil {
-				method := *auth.Method
-				auth.Method = &method
-			}
-			approver.Auth = &auth
-		}
-		opts.Approver = &approver
 	}
 	opts.ToolAliases = cloneMap(opts.ToolAliases)
 	src, err := fs.ReadFile(fsys, mappingPath)
@@ -109,20 +89,17 @@ func New(fsys fs.FS, mappingPath string, evaluator Evaluator, opts Options) (*En
 	}
 	for _, point := range slices.Sorted(maps.Keys(mp.InterventionPoints)) {
 		row := mp.InterventionPoints[point]
-		if row.ACSMethod != nil && evaluator.Governs(point) && point != PointPreToolCall && point != PointPostToolCall {
+		if row.ACSMethod != nil && evaluator.Governs(point) && !AssemblesSnapshot(point) {
 			return nil, fmt.Errorf("agtbridge: mapping.yaml sends %s to intervention point %q, which the manifest configures and whose snapshot this bridge does not assemble", *row.ACSMethod, point)
 		}
 	}
 	return &Engine{evaluator: evaluator, mapping: mp, opts: opts}, nil
 }
 
-// Policy implements guardian.PolicyEngine.
+// Policy implements guardian.PolicyEngine. The approver types are those the
+// mapping can route an Ask to.
 func (e *Engine) Policy() guardian.PolicyDescription {
-	var d guardian.PolicyDescription
-	if e.opts.Approver != nil {
-		d.ApproverTypes = []acs.ApproverType{e.opts.Approver.Type}
-	}
-	return d
+	return guardian.PolicyDescription{ApproverTypes: e.mapping.approverTypes()}
 }
 
 // Decide implements guardian.PolicyEngine. A step whose method maps to no
@@ -165,16 +142,18 @@ func (e *Engine) Decide(ctx context.Context, in guardian.PolicyInput) (guardian.
 	if alias := e.opts.ToolAliases[policyToolName]; alias != "" {
 		policyToolName = alias
 	}
-	argument, err := e.mapping.policyTargetArgument(point, policyToolName)
-	if err != nil {
-		return guardian.PolicyDecision{}, err
-	}
+	var argument string
 	var snapshot map[string]any
 	switch point {
 	case PointPreToolCall:
+		if argument, err = e.mapping.policyTargetArgument(point, policyToolName); err != nil {
+			return guardian.PolicyDecision{}, err
+		}
 		snapshot, err = preToolCallSnapshot(req, state.IFCLabels, argument, policyToolName)
 	case PointPostToolCall:
 		snapshot, err = postToolCallSnapshot(req, state.IFCLabels, policyToolName)
+	case PointOutput:
+		snapshot, err = outputSnapshot(req, state.IFCLabels)
 	}
 	if err != nil {
 		return guardian.PolicyDecision{}, err
@@ -246,17 +225,19 @@ func readState(raw []byte) (policyState, error) {
 	return s, nil
 }
 
-// ask completes an Ask with its details, or answers DENY when no approver is
-// configured: an Ask nobody can resolve is a denial with its reason stated.
+// ask completes an Ask with the approver the mapping names for its reason, or
+// answers DENY when it names none: an Ask nobody can resolve is a denial with
+// its reason stated.
 func (e *Engine) ask(d acs.Decision) acs.Decision {
-	if e.opts.Approver == nil {
+	approver, ok := e.mapping.approver(d.ReasonCodes)
+	if !ok {
 		d.Disposition = acs.Deny
-		d.Reasoning = strings.TrimSpace(d.Reasoning + " No approver is configured for this Guardian, so the step is denied.")
+		d.Reasoning = strings.TrimSpace(d.Reasoning + " mapping.yaml names no approver for this reason, so the step is denied.")
 		d.ReasonCodes = append(slices.Clip(d.ReasonCodes), "approver_unavailable")
 		return d
 	}
 	d.AskDetails = &acs.AskDetails{
-		Approver:       *e.opts.Approver,
+		Approver:       approver,
 		Question:       d.Reasoning,
 		TimeoutSeconds: int64(e.opts.AskTimeout / time.Second),
 	}

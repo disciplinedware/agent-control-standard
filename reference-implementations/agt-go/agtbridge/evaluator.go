@@ -2,12 +2,19 @@ package agtbridge
 
 import "context"
 
-// The two intervention points whose snapshot this bridge assembles, the
-// ones the TypeScript reference assembles.
+// The intervention points whose snapshot this bridge assembles: the two tool
+// points the TypeScript reference assembles, and output, the agent's reply.
 const (
 	PointPreToolCall  = "pre_tool_call"
 	PointPostToolCall = "post_tool_call"
+	PointOutput       = "output"
 )
+
+// AssemblesSnapshot reports whether this bridge assembles the snapshot of an
+// intervention point.
+func AssemblesSnapshot(point string) bool {
+	return point == PointPreToolCall || point == PointPostToolCall || point == PointOutput
+}
 
 // Evaluator executes AGT's policy for the projection. Two exist: the Go
 // evaluator (package goeval) and the AGT evaluator, which calls AGT's own

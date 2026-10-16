@@ -36,6 +36,12 @@ enabled only after the policy engine and Guardian are ready.
 | `policy.ask_substitution` | Endpoint behavior when ASK cannot be completed. | `none`, `deny` or `defer`. |
 | `policy.tool_aliases` | Optional map from an Observed Agent's tool name to the manifest's tool name. | Both names must be non-empty. |
 
+Whom an ASK goes to is not configuration: the deployment's `mapping.yaml`
+names an approver per escalate reason in
+`field_synthesis.ask_details.approver.by_reason`, and the ASK waits
+`DefaultAskTimeout` (five minutes). An escalate whose reason has no entry is
+DENY `approver_unavailable`.
+
 `ask_substitution: none` leaves an ASK from the engine unchanged. `deny` returns DENY
 `approver_unavailable`. `defer` returns DEFER with a deny timeout decision. The
 setting belongs to this Guardian endpoint; it is not tied to a particular host
@@ -86,6 +92,7 @@ endpoint therefore embed the library with a shared `SessionContextStore`.
 | Key | Meaning | Constraint |
 | --- | --- | --- |
 | `protocol.on_decision_failure` | Failure posture advertised in `ServerHello`. | `proceed` or `deny`. |
+| `protocol.methods_evaluated` | Native hooks advertised in `ServerHello` as `methods_evaluated`. A hook left out is not evaluated: the Observed Agent treats it as ALLOW and need not send it (`handshake.json`). Unset, every native hook is evaluated. | Non-empty list of `steps/*` hooks, each once. |
 | `protocol.decision_timeout` | Default deadline for a policy decision. | Positive duration and shorter than `server.write_timeout`. |
 | `protocol.skew_window` | Accepted timestamp distance in either direction. | Positive duration. |
 

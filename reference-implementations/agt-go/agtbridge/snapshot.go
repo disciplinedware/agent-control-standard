@@ -1,9 +1,11 @@
 package agtbridge
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	jsonv2 "github.com/go-json-experiment/json"
 
@@ -31,15 +33,34 @@ func ifcInput(labels []string) map[string]any {
 	return map[string]any{"ifc": map[string]any{"source_labels": source}}
 }
 
+// withActor adds the step's metadata.user_context, in its wire shape, as the
+// snapshot's actor: who the host says the agent acts for. AGT's snapshot has
+// no caller identity of its own; its runtime passes the whole snapshot to
+// Rego, so a rule reads input.snapshot.actor (docs/conformance.md).
+func withActor(snapshot map[string]any, req acs.Request) (map[string]any, error) {
+	if req.Params.Metadata.UserContext == nil {
+		return snapshot, nil
+	}
+	raw, err := jsonv2.Marshal(req.Params.Metadata.UserContext)
+	if err != nil {
+		return nil, err
+	}
+	var actor map[string]any
+	if err := jsonv2.Unmarshal(raw, &actor); err != nil {
+		return nil, err
+	}
+	snapshot["actor"] = actor
+	return snapshot, nil
+}
+
 // preToolCallSnapshot copies each argument's value into args, and the policy
-// target argument's value into the fixed leaf as well.
+// target argument's value, when the mapping names one, into the fixed leaf as
+// well. With none, the manifest's policy_target addresses the snapshot
+// directly, for example $.tool_call.name for a tool that takes no argument.
 func preToolCallSnapshot(req acs.Request, labels []string, argument, policyToolName string) (map[string]any, error) {
 	var payload acs.ToolCallRequestPayload
 	if err := jsonv2.Unmarshal(req.Params.Payload, &payload); err != nil {
 		return nil, err
-	}
-	if argument == "" {
-		return nil, fmt.Errorf("mapping.yaml declares no policy_target_argument for the request gate, so there is no argument to copy to the %q leaf the manifest targets", PolicyTargetLeaf)
 	}
 	args := map[string]any{}
 	for name, a := range payload.Arguments {
@@ -52,26 +73,28 @@ func preToolCallSnapshot(req acs.Request, labels []string, argument, policyToolN
 	if _, clash := args[PolicyTargetLeaf]; clash {
 		return nil, fmt.Errorf("tool %q sent an argument named %q, which is the leaf this Guardian writes its policy target to", payload.Tool.Name, PolicyTargetLeaf)
 	}
-	value, ok := args[argument]
-	if !ok {
-		sent := slices.Sorted(maps.Keys(args))
-		return nil, fmt.Errorf("mapping.yaml reads tool %q's policy target from argument %q, but this call sent no such argument (it sent: %v)", payload.Tool.Name, argument, sent)
+	if argument != "" {
+		value, ok := args[argument]
+		if !ok {
+			sent := slices.Sorted(maps.Keys(args))
+			return nil, fmt.Errorf("mapping.yaml reads tool %q's policy target from argument %q, but this call sent no such argument (it sent: %v)", payload.Tool.Name, argument, sent)
+		}
+		// The stock rules guard their targets with is_string; a target of any
+		// other JSON type would pass every one of them.
+		if _, isString := value.(string); !isString {
+			return nil, fmt.Errorf("tool %q sent argument %q as a JSON %s, but its policy target must be a string", payload.Tool.Name, argument, jsonKind(value))
+		}
+		args[PolicyTargetLeaf] = value
 	}
-	// The stock rules guard their targets with is_string; a target of any
-	// other JSON type would pass every one of them.
-	if _, isString := value.(string); !isString {
-		return nil, fmt.Errorf("tool %q sent argument %q as a JSON %s, but its policy target must be a string", payload.Tool.Name, argument, jsonKind(value))
-	}
-	args[PolicyTargetLeaf] = value
 	raw := ""
 	if payload.RawCommand != nil {
 		raw = *payload.RawCommand
 	}
-	return map[string]any{
+	return withActor(map[string]any{
 		"envelope":  map[string]any{"budgets": budgets()},
 		"tool_call": map[string]any{"name": policyToolName, "args": args, "id": req.Params.RequestID, "raw_command": raw},
 		"input":     ifcInput(labels),
-	}, nil
+	}, req)
 }
 
 func postToolCallSnapshot(req acs.Request, labels []string, policyToolName string) (map[string]any, error) {
@@ -87,12 +110,69 @@ func postToolCallSnapshot(req acs.Request, labels []string, policyToolName strin
 		}
 		outputs[i] = map[string]any{"value": v}
 	}
-	return map[string]any{
+	return withActor(map[string]any{
 		"envelope":    map[string]any{"budgets": budgets()},
 		"tool_call":   map[string]any{"name": policyToolName},
 		"tool_result": map[string]any{"outputs": outputs},
 		"input":       ifcInput(labels),
-	}, nil
+	}, req)
+}
+
+// appendStrings appends every string in a decoded JSON value, in document
+// order for arrays and key order for objects.
+func appendStrings(lines []string, value any) []string {
+	switch v := value.(type) {
+	case string:
+		return append(lines, v)
+	case []any:
+		for _, item := range v {
+			lines = appendStrings(lines, item)
+		}
+	case map[string]any:
+		for _, key := range slices.Sorted(maps.Keys(v)) {
+			lines = appendStrings(lines, v[key])
+		}
+	}
+	return lines
+}
+
+// agentResponsePayload is the part of steps/agentResponse (hooks/agent-response.json)
+// the output snapshot reads.
+type agentResponsePayload struct {
+	Content []struct {
+		Type  string          `json:"type"`
+		Value json.RawMessage `json:"value"`
+	} `json:"content"`
+}
+
+// outputSnapshot is AGT's output point (AGT-SNAPSHOT-1.0 §2.7): the whole
+// reply as response.content, one line per string - a text item's text, and
+// every string inside any other item's decoded value, so a link in an image
+// or file item reaches the rules as the host will read it, never in an
+// escaped JSON form a pattern misses; the session's labels as result_labels;
+// an empty message_chain, since ACS carries none.
+func outputSnapshot(req acs.Request, labels []string) (map[string]any, error) {
+	var payload agentResponsePayload
+	if err := jsonv2.Unmarshal(req.Params.Payload, &payload); err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, item := range payload.Content {
+		var value any
+		if err := jsonv2.Unmarshal(item.Value, &value); err != nil {
+			return nil, err
+		}
+		lines = appendStrings(lines, value)
+	}
+	resultLabels := make([]any, len(labels))
+	for i, l := range labels {
+		resultLabels[i] = l
+	}
+	return withActor(map[string]any{
+		"envelope":      map[string]any{"budgets": budgets()},
+		"response":      map[string]any{"content": strings.Join(lines, "\n"), "ifc": map[string]any{"result_labels": resultLabels}},
+		"message_chain": []any{},
+	}, req)
 }
 
 // jsonKind names the JSON type of a value that jsonv2 decoded into any.

@@ -13,6 +13,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/acs"
+	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/internal/schema"
 )
 
 // mapping is the TypeScript reference's mapping.yaml, the single source of
@@ -37,8 +38,49 @@ type mappingPoint struct {
 }
 
 type policyTargetArgument struct {
-	Default string            `yaml:"default"`
-	ByTool  map[string]string `yaml:"by_tool"`
+	// Default names the argument of every tool ByTool does not name; an
+	// explicit null names none, for a manifest that targets the tool itself.
+	Default optionalArgument `yaml:"default"`
+	// ByTool names each tool's argument; an explicit null names a tool that
+	// takes none, whose policy target the manifest's own policy_target reads.
+	ByTool map[string]*string `yaml:"by_tool"`
+}
+
+// optionalArgument tells an absent key from an explicit null: absent, the
+// mapping says nothing; null, it says the tool takes no argument.
+type optionalArgument struct {
+	set   bool
+	value *string
+}
+
+// UnmarshalYAML reads the table itself, because yaml.v3 decodes a null to a
+// field's zero value without asking the field, so `default: null` would read
+// as an absent default.
+func (p *policyTargetArgument) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("policy_target_argument must be a mapping")
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		switch key.Value {
+		case "default":
+			p.Default.set = true
+			if value.Tag != "!!null" {
+				var named string
+				if err := value.Decode(&named); err != nil {
+					return fmt.Errorf("policy_target_argument.default: %w", err)
+				}
+				p.Default.value = &named
+			}
+		case "by_tool":
+			if err := value.Decode(&p.ByTool); err != nil {
+				return fmt.Errorf("policy_target_argument.by_tool: %w", err)
+			}
+		default:
+			return fmt.Errorf("policy_target_argument has an unknown key %q", key.Value)
+		}
+	}
+	return nil
 }
 
 type modificationsRule struct {
@@ -76,6 +118,40 @@ type fieldSynthesis struct {
 			Literal string `yaml:"literal"`
 		} `yaml:"policy_id"`
 	} `yaml:"policy_references"`
+	AskDetails struct {
+		Approver struct {
+			ByReason map[string]mappedApprover `yaml:"by_reason"`
+		} `yaml:"approver"`
+	} `yaml:"ask_details"`
+}
+
+// mappedApprover is an approver ask-details.json admits, as the mapping
+// names it for one escalate reason.
+type mappedApprover struct {
+	Type     acs.ApproverType `yaml:"type"`
+	ID       string           `yaml:"id"`
+	Endpoint *string          `yaml:"endpoint"`
+	Auth     *struct {
+		Method *string `yaml:"method"`
+	} `yaml:"auth"`
+}
+
+// approver is the ACS approver; each call returns fresh pointers, so no
+// decision shares memory with the mapping.
+func (a mappedApprover) approver() acs.Approver {
+	out := acs.Approver{Type: a.Type, ID: a.ID}
+	if a.Endpoint != nil {
+		endpoint := *a.Endpoint
+		out.Endpoint = &endpoint
+	}
+	if a.Auth != nil {
+		out.Auth = &acs.ApproverAuth{}
+		if a.Auth.Method != nil {
+			method := *a.Auth.Method
+			out.Auth.Method = &method
+		}
+	}
+	return out
 }
 
 var verdictFields = []string{"verdict.decision", "verdict.reason", "verdict.message", "verdict.transform", "verdict.result_labels"}
@@ -94,6 +170,24 @@ func parseMapping(src []byte) (*mapping, error) {
 	for _, source := range []string{fs.Reasoning.Source, fs.ReasonCodes.Source, fs.PolicyReferences.RuleID.Source} {
 		if !slices.Contains(verdictFields, source) {
 			return nil, fmt.Errorf("mapping.yaml: field_synthesis reads %q, which is not a verdict field", source)
+		}
+	}
+	if len(fs.AskDetails.Approver.ByReason) > 0 {
+		schemas, err := schema.Load()
+		if err != nil {
+			return nil, err
+		}
+		for reason, a := range fs.AskDetails.Approver.ByReason {
+			wire, err := jsonv2.Marshal(a.approver())
+			if err != nil {
+				return nil, err
+			}
+			if err := schemas.ValidateJSON(schema.AskApprover, wire); err != nil {
+				return nil, fmt.Errorf("mapping.yaml: field_synthesis.ask_details.approver.by_reason.%s is not an ask-details.json approver: %w", reason, err)
+			}
+			if strings.TrimSpace(a.ID) == "" {
+				return nil, fmt.Errorf("mapping.yaml: field_synthesis.ask_details.approver.by_reason.%s has no id", reason)
+			}
 		}
 	}
 	if fs.ReasonCodes.Wrap != "array" {
@@ -115,6 +209,16 @@ func parseMapping(src []byte) (*mapping, error) {
 	}
 	methods := map[string]string{}
 	for point, row := range m.InterventionPoints {
+		if table := row.PolicyTargetArgument; table != nil {
+			for tool, named := range table.ByTool {
+				if named != nil && strings.TrimSpace(*named) == "" {
+					return nil, fmt.Errorf("mapping.yaml: intervention_points.%s.policy_target_argument.by_tool.%s is empty; write null for a tool that takes no argument", point, tool)
+				}
+			}
+			if v := table.Default.value; v != nil && strings.TrimSpace(*v) == "" {
+				return nil, fmt.Errorf("mapping.yaml: intervention_points.%s.policy_target_argument.default is empty; write null for tools that take no argument", point)
+			}
+		}
 		if row.ACSMethod != nil {
 			if other, dup := methods[*row.ACSMethod]; dup {
 				return nil, fmt.Errorf("mapping.yaml: %s maps to both %s and %s", *row.ACSMethod, other, point)
@@ -141,19 +245,53 @@ func (m *mapping) point(method string) (string, bool) {
 }
 
 // policyTargetArgument is the tool argument a point's policy target is read
-// from and an override is written to; empty when the point declares none.
+// from and an override is written to. It is empty only for a tool the mapping
+// names explicitly as taking none (`by_tool: {tool: null}`, or `default:
+// null` for every tool by_tool does not name); the manifest's own
+// policy_target then decides what AGT reads. A tool the mapping names no
+// argument for, by name or by default, is refused, as the TypeScript
+// Guardian refuses it (assemble-snapshot.ts, map-verdict.ts).
 func (m *mapping) policyTargetArgument(point, tool string) (string, error) {
 	table := m.InterventionPoints[point].PolicyTargetArgument
 	if table == nil {
-		return "", nil
+		return "", fmt.Errorf("mapping.yaml declares no policy_target_argument for %s, so tool %q's policy target has no argument to be read from", point, tool)
 	}
 	if named, ok := table.ByTool[tool]; ok {
-		return named, nil
+		if named == nil {
+			return "", nil
+		}
+		return *named, nil
 	}
-	if table.Default == "" {
+	if !table.Default.set {
 		return "", fmt.Errorf("mapping.yaml's intervention_points.%s.policy_target_argument names no argument for tool %q and declares no default", point, tool)
 	}
-	return table.Default, nil
+	if table.Default.value == nil {
+		return "", nil
+	}
+	return *table.Default.value, nil
+}
+
+// approver is the approver the mapping names for an Ask's reason, the first
+// reason code, which field_synthesis.reason_codes reads from the verdict.
+func (m *mapping) approver(reasonCodes []string) (acs.Approver, bool) {
+	if len(reasonCodes) == 0 {
+		return acs.Approver{}, false
+	}
+	a, ok := m.FieldSynthesis.AskDetails.Approver.ByReason[reasonCodes[0]]
+	return a.approver(), ok
+}
+
+// approverTypes are the approver types the mapping can route an Ask to, the
+// Guardian's approver_types_supported.
+func (m *mapping) approverTypes() []acs.ApproverType {
+	var types []acs.ApproverType
+	for _, a := range m.FieldSynthesis.AskDetails.Approver.ByReason {
+		if !slices.Contains(types, a.Type) {
+			types = append(types, a.Type)
+		}
+	}
+	slices.Sort(types)
+	return types
 }
 
 // decision translates a verdict at a point, as mapVerdict does.

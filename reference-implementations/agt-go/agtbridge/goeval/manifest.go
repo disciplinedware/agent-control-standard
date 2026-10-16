@@ -129,7 +129,7 @@ func (m *manifest) compile() (map[string]*compiledPoint, error) {
 		if !slices.Contains(knownPoints, name) {
 			return nil, invalid("unknown intervention point %q", name)
 		}
-		if name != agtbridge.PointPreToolCall && name != agtbridge.PointPostToolCall {
+		if !agtbridge.AssemblesSnapshot(name) {
 			return nil, unsupported(fmt.Sprintf("intervention point %q, whose snapshot agtbridge does not assemble", name))
 		}
 		cp, err := m.compilePoint(name, cfg)
@@ -156,6 +156,9 @@ func (m *manifest) compilePoint(name string, cfg pointConfig) (*compiledPoint, e
 	cp.target = target
 	if cfg.PolicyTargetKind != nil && strings.TrimSpace(*cfg.PolicyTargetKind) == "" {
 		return nil, invalid("policy_target_kind is empty")
+	}
+	if cfg.ToolNameFrom != nil && name != agtbridge.PointPreToolCall && name != agtbridge.PointPostToolCall {
+		return nil, invalid("tool_name_from is only valid on a tool intervention point")
 	}
 	if cfg.ToolNameFrom != nil {
 		p, err := parseSnapshotPath(*cfg.ToolNameFrom)

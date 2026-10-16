@@ -32,6 +32,14 @@ var knownDifferences []knownDifference
 
 func init() {
 	recordedEvaluators["agt"] = func(t testing.TB) agtbridge.Evaluator { return agtEvaluator(t) }
+	deploymentEvaluators["agt"] = func(t testing.TB, dir string) agtbridge.Evaluator {
+		t.Helper()
+		e, err := agteval.New(agteval.Config{ManifestPath: dir + "/policy/manifest.yaml", OPAPath: "../.acs/agt/" + runtime.GOOS + "-" + runtime.GOARCH + "/bin", OPATimeout: 5 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
 }
 
 func agtEvaluator(t testing.TB) *agteval.Evaluator {

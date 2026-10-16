@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/acs"
+	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/internal/method"
 )
 
 // Defaults a zero Config field takes.
@@ -85,6 +87,12 @@ type Config struct {
 	// OnDecisionFailure is the posture the ServerHello declares (§6.4);
 	// empty means proceed, the specification's default.
 	OnDecisionFailure acs.FailurePosture
+	// EvaluatedHooks lists the native hooks the ServerHello offers in
+	// methods_evaluated. A hook left out is not evaluated, and handshake.json
+	// has the Observed Agent treat it as ALLOW without sending it, so a
+	// deployment pays no round trip for a step its policy does not read. Nil
+	// means every native hook.
+	EvaluatedHooks []string
 	// AskSubstitution is the deployment-defined §9.2 choice for this
 	// endpoint. Empty means AskSubstitutionNone.
 	AskSubstitution AskSubstitution
@@ -155,6 +163,24 @@ func (c Config) withDefaults() (Config, error) {
 	case AskSubstitutionNone, AskSubstitutionDeny, AskSubstitutionDefer:
 	default:
 		return c, fmt.Errorf("guardian: AskSubstitution is %q, it must be none, deny or defer", c.AskSubstitution)
+	}
+	switch {
+	case c.EvaluatedHooks == nil:
+		c.EvaluatedHooks = method.Hooks()
+	case len(c.EvaluatedHooks) == 0:
+		return c, errors.New("guardian: EvaluatedHooks names no hook, so every step would be allowed unevaluated; leave it nil to evaluate every native hook")
+	default:
+		hooks := slices.Clone(c.EvaluatedHooks)
+		slices.Sort(hooks)
+		for i, hook := range hooks {
+			if !slices.Contains(method.Hooks(), hook) {
+				return c, fmt.Errorf("guardian: EvaluatedHooks names %q, which is not a native hook", hook)
+			}
+			if i > 0 && hooks[i-1] == hook {
+				return c, fmt.Errorf("guardian: EvaluatedHooks names %q twice", hook)
+			}
+		}
+		c.EvaluatedHooks = hooks
 	}
 	switch c.Transport {
 	case "":

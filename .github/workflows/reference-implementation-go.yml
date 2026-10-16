@@ -5,7 +5,8 @@
 # the module embeds a copy of the schemas and a test fails when the copy stops
 # matching them. The AGT bundle and mapping are in it because the Go Guardian reads
 # them from reference-implementations/agt/. The shared conformance package is
-# included because make check runs it against the Go Guardian.
+# included because make check runs it against the Go Guardian, and the host
+# adapter because the conformance package signs with it.
 #
 # Native platforms run the complete gate. The pure job also checks cgo is absent.
 #
@@ -23,6 +24,7 @@ on:
       - "reference-implementations/agt/packages/agt-bridge/src/**"
       - "reference-implementations/agt/packages/agt-bridge/package.json"
       - "reference-implementations/agt/packages/conformance/**"
+      - "reference-implementations/agt/packages/host-adapter/src/**"
       - "reference-implementations/agt/package.json"
       - "reference-implementations/agt/bun.lock"
       - "specification/**"
@@ -39,6 +41,7 @@ on:
       - "reference-implementations/agt/packages/agt-bridge/src/**"
       - "reference-implementations/agt/packages/agt-bridge/package.json"
       - "reference-implementations/agt/packages/conformance/**"
+      - "reference-implementations/agt/packages/host-adapter/src/**"
       - "reference-implementations/agt/package.json"
       - "reference-implementations/agt/bun.lock"
       - "specification/**"

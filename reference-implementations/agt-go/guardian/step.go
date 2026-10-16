@@ -114,7 +114,7 @@ func (g *Guardian) handshakeAgain(ctx context.Context, in *call, req acs.Request
 func (g *Guardian) offer() handshake.Offer {
 	return handshake.Offer{
 		Version:                  acs.Version,
-		Hooks:                    method.Hooks(),
+		Hooks:                    g.cfg.EvaluatedHooks,
 		Wrapped:                  g.methods,
 		Transport:                g.cfg.Transport,
 		SignatureAlgorithms:      slices.Clone(g.algorithms),

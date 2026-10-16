@@ -356,31 +356,27 @@ tools:
   Bash: {type: Tool}
 `)
 	mustWrite(t, dir, "policy/lib/escalating.rego", "package escalating\n\nverdict := {\"decision\": \"escalate\", \"reason\": \"approval_required\", \"message\": \"needs a human\"}\n")
-	mapping, err := os.ReadFile(agtTree + "/mapping.yaml")
+	stock, err := os.ReadFile(agtTree + "/mapping.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustWrite(t, dir, "mapping.yaml", string(mapping))
-
-	endpoint := "https://approver.example.com"
-	authMethod := "mTLS"
+	const stockTable = "  ask_details:\n    approver:\n      by_reason: {}\n"
+	if !strings.Contains(string(stock), stockTable) {
+		t.Fatal("the stock mapping.yaml no longer declares an empty field_synthesis.ask_details.approver.by_reason")
+	}
 	for _, tt := range []struct {
-		name     string
-		approver *acs.Approver
-		want     acs.Disposition
+		name  string
+		table string
+		want  acs.Disposition
 	}{
-		{"no_approver", nil, acs.Deny},
-		{"approver", &acs.Approver{Type: acs.ApproverService, ID: "security-service", Endpoint: &endpoint, Auth: &acs.ApproverAuth{Method: &authMethod}}, acs.Ask},
+		{"unlisted_reason_denies", "  ask_details:\n    approver:\n      by_reason:\n        some_other_reason: {type: human, id: owner}\n", acs.Deny},
+		{"listed_reason_asks_its_approver", "  ask_details:\n    approver:\n      by_reason:\n        approval_required: {type: service, id: security-service, endpoint: \"https://approver.example.com\", auth: {method: mtls}}\n", acs.Ask},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			e, err := goEngine(os.DirFS(dir), "policy/manifest.yaml", "mapping.yaml", agtbridge.Options{Approver: tt.approver})
+			mustWrite(t, dir, "mapping.yaml", strings.Replace(string(stock), stockTable, tt.table, 1))
+			e, err := goEngine(os.DirFS(dir), "policy/manifest.yaml", "mapping.yaml", agtbridge.Options{})
 			if err != nil {
 				t.Fatal(err)
-			}
-			if tt.approver != nil {
-				tt.approver.ID = "mutated"
-				*tt.approver.Endpoint = "https://mutated.example.com"
-				*tt.approver.Auth.Method = "mutated"
 			}
 			d, err := e.Decide(context.Background(), input(t, acs.StepToolCallRequest, shell("deploy")))
 			if err != nil {
@@ -389,20 +385,53 @@ tools:
 			if d.Disposition != tt.want {
 				t.Fatalf("got %+v", d.Decision)
 			}
-			if tt.approver == nil {
-				if !slices.Contains(d.ReasonCodes, "approver_unavailable") || len(e.Policy().ApproverTypes) != 0 {
-					t.Fatalf("got %+v", d.Decision)
+			if tt.want == acs.Deny {
+				if !slices.Contains(d.ReasonCodes, "approver_unavailable") || !slices.Equal(e.Policy().ApproverTypes, []acs.ApproverType{acs.ApproverHuman}) {
+					t.Fatalf("got %+v, approver types %v", d.Decision, e.Policy().ApproverTypes)
 				}
 				return
 			}
 			if d.AskDetails == nil || d.AskDetails.Approver.ID != "security-service" || d.AskDetails.Approver.Endpoint == nil ||
 				*d.AskDetails.Approver.Endpoint != "https://approver.example.com" || d.AskDetails.Approver.Auth == nil ||
-				d.AskDetails.Approver.Auth.Method == nil || *d.AskDetails.Approver.Auth.Method != "mTLS" ||
+				d.AskDetails.Approver.Auth.Method == nil || *d.AskDetails.Approver.Auth.Method != "mtls" ||
 				d.AskDetails.TimeoutSeconds != 300 || d.AskDetails.Question != d.Reasoning {
 				t.Fatalf("ask details %+v", d.AskDetails)
 			}
+			*d.AskDetails.Approver.Endpoint = "https://mutated.example.com"
+			again, err := e.Decide(context.Background(), input(t, acs.StepToolCallRequest, shell("deploy")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if *again.AskDetails.Approver.Endpoint != "https://approver.example.com" {
+				t.Fatal("a decision shares the approver's endpoint with the mapping")
+			}
 			if !slices.Equal(e.Policy().ApproverTypes, []acs.ApproverType{acs.ApproverService}) {
 				t.Fatalf("approver types %v", e.Policy().ApproverTypes)
+			}
+		})
+	}
+}
+
+// Each approver row must be an ask-details.json approver: the schema decides,
+// so an auth method or endpoint it does not admit stops the Guardian at load.
+func TestApproverRowsAreCheckedAgainstAskDetails(t *testing.T) {
+	stock, err := os.ReadFile(agtTree + "/mapping.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const stockTable = "  ask_details:\n    approver:\n      by_reason: {}\n"
+	for name, row := range map[string]string{
+		"an_auth_method_in_another_case": "{type: service, id: s, endpoint: \"https://approver.example.com\", auth: {method: mTLS}}",
+		"an_unknown_auth_method":         "{type: service, id: s, endpoint: \"https://approver.example.com\", auth: {method: basic}}",
+		"an_endpoint_that_is_no_uri":     "{type: service, id: s, endpoint: \"not a uri\"}",
+		"an_unknown_type":                "{type: robot, id: s}",
+		"no_id":                          "{type: human, id: \"\"}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			mustWrite(t, dir, "mapping.yaml", strings.Replace(string(stock), stockTable, "  ask_details:\n    approver:\n      by_reason:\n        approval_required: "+row+"\n", 1))
+			if _, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", pointsEvaluator{agtbridge.PointPreToolCall}, agtbridge.Options{}); err == nil {
+				t.Fatal("the approver row was accepted")
 			}
 		})
 	}

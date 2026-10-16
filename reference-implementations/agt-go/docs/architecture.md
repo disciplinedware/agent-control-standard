@@ -45,8 +45,9 @@ TypeScript reference reaches the same crate version through AGT's Node package.
 
 `agtbridge.Engine` holds one projection and one evaluator. The projection is
 what a host does around AGT: it keeps the session's labels, assembles the
-snapshot, supplies the `egress` annotator and turns each verdict into an ACS
-decision through `mapping.yaml`. The evaluator runs AGT's policy for that
+snapshot at `pre_tool_call`, `post_tool_call` and `output` with the caller as
+`actor`, supplies the `egress` annotator and turns each verdict into an ACS
+decision through `mapping.yaml`, which also names the approver of an ASK. The evaluator runs AGT's policy for that
 snapshot. `policy.evaluator` selects it:
 
 | Evaluator | Package | What decides | Build |
