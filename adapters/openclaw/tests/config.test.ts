@@ -3,8 +3,9 @@ import { mkdtempSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin from "../acs-plugin.ts";
-import { DEFAULT_BLOCKED_REPLY_TEXT, parseConfig, PluginConfigError } from "../config.ts";
+import { parseConfig, PluginConfigError } from "../config.ts";
 import { VERIFIED_OPENCLAW_VERSION } from "../requirements.ts";
+import { memoryPluginState } from "./memory-plugin-state.ts";
 
 const HKDF = { salt: "", infoPrefix: "", sessionIdEncoding: "utf8" } as const;
 const KEY = Buffer.from("0123456789abcdef0123456789abcdef");
@@ -40,9 +41,9 @@ describe("parseConfig", () => {
       guardianUrl: VALID.guardianUrl,
       failurePosture: "closed",
       deadlineMs: 5000,
-      blockedReplyText: DEFAULT_BLOCKED_REPLY_TEXT,
       auditLog: ".acs/audit.jsonl",
     });
+    expect(config).not.toHaveProperty("blockedReplyText");
     expect([...config.approvers]).toEqual([]);
     expect(config.signingKey).toEqual({ keyId: "example-key", secret: KEY, hkdf: HKDF });
   });
@@ -72,6 +73,7 @@ describe("parseConfig", () => {
     ["a_deadline_as_long_as_the_hook_timeout", { ...VALID, deadlineMs: 15_000 }, ENV, "shorter than"],
     ["a_deadline_longer_than_a_set_hook_timeout", { ...VALID, deadlineMs: 6000, hookTimeoutMs: 5000 }, ENV, "shorter than"],
     ["a_zero_undecided_cap", { ...VALID, maxUndecidedMessages: 0 }, ENV, "maxUndecidedMessages"],
+    ["an_empty_blocked_reply_text", { ...VALID, blockedReplyText: "" }, ENV, "blockedReplyText"],
     // The Go Guardian refuses a key shorter than SHA-256's 32 bytes (RFC 2104 §3).
     ["a_key_shorter_than_32_bytes", VALID, { ACS_KEY: KEY.subarray(1).toString("base64") }, "at least 32"],
     ["a_key_not_in_base64", VALID, { ACS_KEY: "0123456789abcdef0123456789abcdef!" }, "not standard base64"],
@@ -84,22 +86,7 @@ describe("the plugin entry", () => {
   type Registered = { name: string; handler: (...args: unknown[]) => unknown; priority?: number; timeoutMs?: number };
 
   /** OpenClaw's retained plugin state, kept in a map. */
-  const STATE = {
-    openKeyedStore() {
-      const rows = new Map<string, unknown>();
-      return {
-        async register(key: string, value: unknown) {
-          rows.set(key, value);
-        },
-        async delete(key: string) {
-          rows.delete(key);
-        },
-        async entries() {
-          return [...rows].map(([key, value]) => ({ key, value }));
-        },
-      };
-    },
-  };
+  const STATE = memoryPluginState();
 
   /** An OpenClaw config that meets every requirement checked at registration. */
   const ENABLED = {
@@ -114,13 +101,16 @@ describe("the plugin entry", () => {
     pluginConfig: Record<string, unknown>,
     runtime: Record<string, unknown> = { state: STATE, config: ENABLED, version: VERIFIED_OPENCLAW_VERSION },
     hasMiddleware = true,
+    hasRunStateStore = true,
   ): { registered: Registered[]; middleware: Array<{ runtimes: string[] }>; errors: string[] } {
     const registered: Registered[] = [];
     const middleware: Array<{ runtimes: string[] }> = [];
     const errors: string[] = [];
+    const hostRuntime = { ...runtime };
+    if (!hasRunStateStore) delete hostRuntime.state;
     plugin.register({
       pluginConfig,
-      runtime: runtime as never,
+      runtime: hostRuntime as never,
       logger: { error: (message: string) => errors.push(message) },
       on: (name: string, handler: (...args: never[]) => unknown, options?: { priority?: number; timeoutMs?: number }) => {
         registered.push({ name, handler: handler as (...args: unknown[]) => unknown, priority: options?.priority, timeoutMs: options?.timeoutMs });
@@ -156,21 +146,32 @@ describe("the plugin entry", () => {
     });
   });
 
-  it("says when it can keep admitted sessions in memory only", () => {
-    process.env.ACS_OPENCLAW_TEST_KEY = ENV.ACS_KEY;
-    const { errors } = register({ ...VALID, keyEnv: "ACS_OPENCLAW_TEST_KEY" }, { config: ENABLED, version: VERIFIED_OPENCLAW_VERSION });
-    expect(errors).toEqual(["ACS plugin keeps admitted sessions in memory only: this OpenClaw has no plugin state store"]);
-  });
-
   it("blocks every step when its configuration cannot be used", async () => {
     const { registered, errors } = register({ guardianUrl: "http://127.0.0.1:1/acs" });
     expect(errors[0]).toContain('"keyId" is required');
     const hook = (name: string) => registered.find((entry) => entry.name === name)!.handler;
     expect(await hook("before_tool_call")({ toolName: "x", params: {} }, {})).toMatchObject({ block: true });
-    expect(await hook("message_sending")({ to: "x", content: "secret" }, { channelId: "c" })).toEqual({
-      content: DEFAULT_BLOCKED_REPLY_TEXT,
-    });
-    expect(await hook("before_agent_run")({ prompt: "hi" }, {})).toMatchObject({ outcome: "block" });
+    expect(await hook("message_sending")({ to: "x", content: "secret" }, { channelId: "c" })).toEqual({ cancel: true });
+    expect(await hook("before_agent_run")({ prompt: "hi" }, {})).toEqual({ outcome: "block", reason: expect.any(String) });
+    expect(await hook("before_dispatch")({ content: "hi" }, {})).toEqual({ handled: true });
+  });
+
+  it("blocks every step of a deployment that fails a requirement with the text it configured", async () => {
+    process.env.ACS_OPENCLAW_TEST_KEY = ENV.ACS_KEY;
+    const dir = mkdtempSync(join(tmpdir(), "acs-openclaw-"));
+    dirs.push(dir);
+    const config = { ...VALID, keyEnv: "ACS_OPENCLAW_TEST_KEY", blockedReplyText: "Not now.", auditLog: join(dir, "audit.jsonl") };
+    const { registered } = register(config, undefined, false);
+    const hook = (name: string) => registered.find((entry) => entry.name === name)!.handler;
+    expect(await hook("message_sending")({ to: "x", content: "secret" }, { channelId: "c" })).toEqual({ content: "Not now." });
+    expect(await hook("before_dispatch")({ content: "hi" }, {})).toEqual({ handled: true, text: "Not now." });
+  });
+
+  it("blocks every step when OpenClaw does not provide plugin-scoped state", async () => {
+    const { registered, errors } = register({ ...VALID, keyEnv: "ACS_OPENCLAW_TEST_KEY" }, undefined, true, false);
+    expect(errors[0]).toContain("R9: this OpenClaw offers no plugin-scoped state store");
+    const hook = (name: string) => registered.find((entry) => entry.name === name)!.handler;
+    expect(await hook("before_tool_call")({ toolName: "x", params: {} }, {})).toMatchObject({ block: true });
   });
 
   it("declares the tool-result middleware contract OpenClaw checks at registration", async () => {
@@ -187,6 +188,6 @@ describe("the plugin entry", () => {
     await Promise.resolve();
     expect(opened).toBe(0);
     await registered.find((entry) => entry.name === "gateway_start")!.handler({}, {});
-    expect(opened).toBe(1);
+    expect(opened).toBe(2);
   });
 });

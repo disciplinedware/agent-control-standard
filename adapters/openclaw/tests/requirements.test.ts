@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import plugin from "../acs-plugin.ts";
 import type { ToolResultAnswer } from "../openclaw-hooks.ts";
 import { REQUIREMENTS, VERIFIED_OPENCLAW_VERSION } from "../requirements.ts";
+import { memoryPluginState } from "./memory-plugin-state.ts";
 
 const SENDER = "+15550100";
 const OTHER = "+15550199";
@@ -17,7 +18,7 @@ const example = await Bun.file(new URL("../openclaw.json.example", import.meta.u
  * (`agentRuntimeOverride`, `src/config/sessions/types.ts:495`) can make it
  * `codex` whatever the config says, and the plugin cannot read it.
  */
-type Deployment = { settings: Record<string, unknown>; version: string; registrar: boolean; sessionKey: string; session: { runtime: "openclaw" | "codex" } };
+type Deployment = { settings: Record<string, unknown>; version: string; registrar: boolean; runStateStore: boolean; sessionKey: string; session: { runtime: "openclaw" | "codex" } };
 
 /** A deployment that meets every row: the example config, the verified release, a middleware registrar, the sender's own session. */
 function meetsAll(): Deployment {
@@ -25,6 +26,7 @@ function meetsAll(): Deployment {
     settings: structuredClone(example),
     version: VERIFIED_OPENCLAW_VERSION,
     registrar: true,
+    runStateStore: true,
     sessionKey: `agent:main:signal:direct:${SENDER}`,
     session: { runtime: "openclaw" },
   };
@@ -43,6 +45,7 @@ const FLIPS: Record<string, (d: Deployment) => void> = {
   R6: (d) => (d.settings.commands = { allowFrom: { signal: [SENDER] } }),
   R7: (d) => (((d.settings.agents as any).defaults.models["openai/gpt-6-astra"] as Record<string, unknown>).agentRuntime = { id: "codex" }),
   R8: (d) => (d.sessionKey = `agent:main:signal:direct:${OTHER}`),
+  R9: (d) => (d.runStateStore = false),
 };
 
 /**
@@ -70,7 +73,7 @@ async function drive(d: Deployment) {
       auditLog: AUDIT_LOG,
       failurePosture: "negotiated",
     },
-    runtime: { version: d.version, config: { current: () => d.settings } } as never,
+    runtime: { version: d.version, config: { current: () => d.settings }, ...(d.runStateStore ? { state: memoryPluginState() } : {}) } as never,
     logger: { error: (message: string) => errors.push(message) },
     on: (name: string, handler: (...args: never[]) => unknown) => hooks.set(name, handler as (...args: unknown[]) => unknown),
     ...(d.registrar ? { registerAgentToolResultMiddleware: (handler: (...args: never[]) => unknown) => middleware.push(handler as (...args: unknown[]) => unknown) } : {}),

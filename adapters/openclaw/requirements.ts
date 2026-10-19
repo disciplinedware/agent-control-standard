@@ -24,6 +24,7 @@ export type Facts = {
   /** `api.runtime.version`. */
   version?: unknown;
   hasMiddlewareRegistrar?: boolean;
+  hasRunStateStore?: boolean;
   deadlineMs?: number;
   /** The person a run acts for or a message comes from, on `channel`. */
   senderId?: string;
@@ -229,6 +230,13 @@ export const REQUIREMENTS: readonly Requirement[] = [
       sessionKey === undefined || channel === undefined || senderId === undefined
         ? "the step names no session, channel or sender"
         : notOneSenderSessionBecause(sessionKey, channel, senderId, accountId),
+  },
+  {
+    id: "R9",
+    setting: "api.runtime.state.openKeyedStore",
+    checkedAt: ["registration"],
+    check: ({ hasRunStateStore }) =>
+      hasRunStateStore === true ? undefined : "this OpenClaw offers no plugin-scoped state store, so separate hook registrations cannot share run and tool-call authorization",
   },
 ];
 

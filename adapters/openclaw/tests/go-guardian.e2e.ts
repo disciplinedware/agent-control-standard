@@ -12,6 +12,36 @@ import { createAcsExchange } from "../acs-exchange.ts";
 import { createGuardianClient, type AuditEvent, type SigningKey } from "../host-adapter.ts";
 import { createHooks } from "../openclaw-hooks.ts";
 
+function memoryRunFacts() {
+  const values = new Map<string, Record<string, unknown>>();
+  return {
+    async set(runId: string, namespace: string, value: Record<string, unknown>) {
+      values.set(`${runId}\n${namespace}`, structuredClone(value));
+    },
+    async setIfAbsent(runId: string, namespace: string, value: Record<string, unknown>) {
+      const key = `${runId}\n${namespace}`;
+      if (values.has(key)) return false;
+      values.set(key, structuredClone(value));
+      return true;
+    },
+    async get(runId: string, namespace: string) {
+      const value = values.get(`${runId}\n${namespace}`);
+      return value === undefined ? undefined : structuredClone(value);
+    },
+    async consume(runId: string, namespace: string) {
+      const key = `${runId}\n${namespace}`;
+      const value = values.get(key);
+      values.delete(key);
+      return value === undefined ? undefined : structuredClone(value);
+    },
+    async clear(runId: string, namespace?: string) {
+      if (namespace !== undefined) values.delete(`${runId}\n${namespace}`);
+      else for (const key of values.keys()) if (key.startsWith(`${runId}\n`)) values.delete(key);
+    },
+    async pruneOtherProcesses() {},
+  };
+}
+
 const url = process.env.ACS_GUARDIAN_URL;
 const secretFile = process.env.ACS_HMAC_SECRET_FILE;
 const keyId = process.env.ACS_HMAC_KEY_ID;
@@ -31,6 +61,7 @@ function governed(sessionId: string, guardianUrl: string = url!) {
     audit: sink,
     requirementFailure: () => undefined,
     logger: { error: () => {} },
+    runFacts: memoryRunFacts(),
   });
   const run = { runId: `run-${sessionId}`, sessionKey: SESSION_KEY, sessionId, senderId: SENDER, channel: "signal" };
   const tool = { runId: run.runId, sessionKey: SESSION_KEY };

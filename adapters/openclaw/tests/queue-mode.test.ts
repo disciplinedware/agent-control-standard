@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { tmpdir } from "node:os";
 import plugin from "../acs-plugin.ts";
 import { VERIFIED_OPENCLAW_VERSION } from "../requirements.ts";
+import { memoryPluginState } from "./memory-plugin-state.ts";
 import { startFakeAcsServer, type FakeAcsServer, type ReceivedStep, type Reply } from "./fake-acs-server.ts";
 
 const SENDER = "+15550100";
@@ -35,7 +36,7 @@ function deployed(queue: Record<string, unknown>, reply?: (step: ReceivedStep) =
       guardianUrl: server.url,
       auditLog: `${tmpdir()}/acs-openclaw-queue-test.jsonl`,
     },
-    runtime: { version: VERIFIED_OPENCLAW_VERSION, config: { current: () => settings } } as never,
+    runtime: { version: VERIFIED_OPENCLAW_VERSION, config: { current: () => settings }, state: memoryPluginState() } as never,
     logger: { error: () => {} },
     on: (name: string, handler: (...args: never[]) => unknown) => hooks.set(name, handler as (...args: unknown[]) => Promise<unknown>),
     registerAgentToolResultMiddleware: () => {},

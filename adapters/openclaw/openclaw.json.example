@@ -17,8 +17,7 @@
           },
           "approvers": [
             "approver-1"
-          ],
-          "blockedReplyText": "Sorry, I cannot send that reply."
+          ]
         }
       }
     }

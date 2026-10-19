@@ -22,12 +22,10 @@ export type PluginConfig = {
   maxUndecidedMessages: number;
   /** The `ask_details.approver.id` values this host puts to a person. */
   approvers: ReadonlySet<string>;
-  /** What the user is sent in place of a reply or a run that was not allowed. */
-  blockedReplyText: string;
+  /** What the user is sent in place of a reply, a message or a run that was blocked; when absent, nothing is sent in its place. */
+  blockedReplyText?: string;
   auditLog: string;
 };
-
-export const DEFAULT_BLOCKED_REPLY_TEXT = "This reply was withheld by policy.";
 
 /**
  * RFC 2104 §3: an HMAC key shorter than the hash output weakens it. The Go
@@ -41,7 +39,6 @@ const DEFAULTS = {
   hookTimeoutMs: 15_000,
   maxUndecidedMessages: 20,
   approvers: [] as string[],
-  blockedReplyText: DEFAULT_BLOCKED_REPLY_TEXT,
   auditLog: ".acs/audit.jsonl",
 } as const;
 
@@ -192,9 +189,9 @@ export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env):
   if (!Array.isArray(approvers) || !approvers.every(nonEmptyString)) {
     problems.push('"approvers" must be a list of approver ids');
   }
-  const blockedReplyText = raw.blockedReplyText ?? DEFAULTS.blockedReplyText;
-  if (!nonEmptyString(blockedReplyText)) {
-    problems.push('"blockedReplyText" must be a non-empty string');
+  const { blockedReplyText } = raw;
+  if (blockedReplyText !== undefined && !nonEmptyString(blockedReplyText)) {
+    problems.push('"blockedReplyText" must be a non-empty string when set');
   }
   const auditLog = raw.auditLog ?? DEFAULTS.auditLog;
   if (!nonEmptyString(auditLog)) {
@@ -212,7 +209,7 @@ export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env):
     hookTimeoutMs: hookTimeoutMs as number,
     maxUndecidedMessages: maxUndecidedMessages as number,
     approvers: new Set(approvers as string[]),
-    blockedReplyText: blockedReplyText as string,
+    ...(blockedReplyText === undefined ? {} : { blockedReplyText: blockedReplyText as string }),
     auditLog: auditLog as string,
   };
 }

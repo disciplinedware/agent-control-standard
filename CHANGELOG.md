@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.0. Pre-1.0 releases MAY change the ACS-Core baseline and the Trace mappings in patch versions. The wire format version (`acs_version` in the handshake, and the `v0.1.0` in every schema `$id`) evolves separately in the `specification/` directory.
 
+## [Unreleased]
+
+### Fixed
+
+- The OpenClaw adapter binds tool results to the admitted run and exact tool-call decision through OpenClaw's plugin-scoped keyed state, so separate plugin registrations can govern one run without trusting a bare run id.
+- An allowed OpenClaw approval records the shared call fact before the native result middleware reads it; missing or failed writes still withhold the result.
+- The adapter reads a WhatsApp sender display name from the admitted run context when the sender id matches the authenticated user; the display name does not change authorization.
+- Message approvals carry OpenClaw's display-only native scope with their effective channel and recipient set.
+
 ## [0.1.4] - 2026-10-16
 
 This release changes ACS-Trace for producers and consumers. The specification version stays v0.1.0, so the files at the `/schema/v0.1.0/` URIs change in place, and the handshake cannot tell the old rules from the new. Name this release, or its commit, when you claim ACS-Trace conformance.

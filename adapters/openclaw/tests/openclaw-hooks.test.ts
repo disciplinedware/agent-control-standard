@@ -9,10 +9,12 @@ import {
   createHooks,
   type Admission,
   type AdmissionStore,
+  type BeforeDispatchResult,
   type BeforeToolCallResult,
   type Hooks,
   type ToolResultAnswer,
   type ToolResultBlock,
+  type RunFactsStore,
 } from "../openclaw-hooks.ts";
 import { startFakeAcsServer, type FakeAcsServer, type Reply, type ReceivedStep } from "./fake-acs-server.ts";
 
@@ -54,6 +56,42 @@ const ALL_METHODS = [
 
 type Setup = { server: FakeAcsServer; hooks: Hooks; audit: AuditEvent[]; errors: string[]; settingsReads: { count: number } };
 
+function memoryRunFacts(): RunFactsStore {
+  const values = new Map<string, Record<string, unknown>>();
+  const key = (runId: string, namespace: string) => `${runId}\n${namespace}`;
+  return {
+    async set(runId, namespace, value) {
+      values.set(key(runId, namespace), structuredClone(value));
+    },
+    async setIfAbsent(runId, namespace, value) {
+      const entry = key(runId, namespace);
+      if (values.has(entry)) return false;
+      values.set(entry, structuredClone(value));
+      return true;
+    },
+    async get(runId, namespace) {
+      const value = values.get(key(runId, namespace));
+      return value === undefined ? undefined : structuredClone(value);
+    },
+    async consume(runId, namespace) {
+      const entry = key(runId, namespace);
+      const value = values.get(entry);
+      values.delete(entry);
+      return value === undefined ? undefined : structuredClone(value);
+    },
+    async clear(runId, namespace) {
+      if (namespace !== undefined) {
+        values.delete(key(runId, namespace));
+      } else {
+        for (const entry of values.keys()) {
+          if (entry.startsWith(`${runId}\n`)) values.delete(entry);
+        }
+      }
+    },
+    async pruneOtherProcesses() {},
+  };
+}
+
 /** A Guardian answer the test releases, so a hook can be held inside its exchange. */
 function heldAnswer(): { reached: Promise<void>; release(): void; answer(): Promise<Reply> } {
   let release!: () => void;
@@ -92,7 +130,10 @@ function setup(
     ungovernable?: string;
     methodsEvaluated?: string[] | null;
     admissions?: AdmissionStore;
+    runFacts?: RunFactsStore;
     maxUndecidedMessages?: number;
+    /** `null` leaves `blockedReplyText` unset, as by default. */
+    blockedReplyText?: string | null;
   } = {},
 ): Setup {
   const server = startFakeAcsServer({
@@ -119,7 +160,11 @@ function setup(
   const errors: string[] = [];
   const settingsReads = { count: 0 };
   const hooks = createHooks({
-    config: { approvers: new Set(["approver-1"]), blockedReplyText: BLOCKED, maxUndecidedMessages: options.maxUndecidedMessages ?? 20 },
+    config: {
+      approvers: new Set(["approver-1"]),
+      ...(options.blockedReplyText === null ? {} : { blockedReplyText: options.blockedReplyText ?? BLOCKED }),
+      maxUndecidedMessages: options.maxUndecidedMessages ?? 20,
+    },
     exchange,
     audit,
     // The real table over settings that meet it. The hook contexts here name
@@ -130,11 +175,11 @@ function setup(
     },
     logger: { error: (message) => errors.push(message) },
     admissions: options.admissions,
+    runFacts: options.runFacts ?? memoryRunFacts(),
   });
   return { server, hooks, audit: events, errors, settingsReads };
 }
 
-/** Allows the user message and answers every tool call with `decision`. */
 /** Allows every step but the reply, and answers the reply with `answer`. */
 function replyAnswer(answer: Reply): (step: ReceivedStep) => Reply {
   return (step) => (step.method === "steps/agentResponse" ? answer : { decision: { decision: "allow" } });
@@ -655,10 +700,50 @@ describe("message_sending", () => {
     });
   });
 
-  it("replaces a denied reply with the fixed text", async () => {
+  it("replaces a denied reply with the fixed text the deployment configured", async () => {
     const { hooks } = setup({ reply: replyAnswer({ decision: { decision: "deny", reasoning: "foreign link" } }) });
     await startRun(hooks);
     expect(await hooks.messageSending({ to: SENDER, content: "Pay at https://pay.example.net" }, MESSAGE_CTX)).toEqual({ content: BLOCKED });
+  });
+
+  it("sends an automatic reply that no message call carried as steps/agentResponse", async () => {
+    const { server, hooks } = setup({ blockedReplyText: null });
+    await startRun(hooks);
+    expect(await hooks.messageSending({ to: SENDER, content: "Your order ships today." }, MESSAGE_CTX)).toEqual({ content: "Your order ships today." });
+    expect(server.steps.map((step) => step.method)).toEqual(["steps/userMessage", "steps/agentResponse"]);
+  });
+
+  it.each<[string, Reply]>([
+    ["deny", { decision: { decision: "deny", reasoning: "foreign link" } }],
+    ["ask", { decision: { decision: "ask", reasoning: "r", ask_details: { approver: { type: "human", id: "approver-1" }, timeout_seconds: 60 } } }],
+  ])("cancels a reply answered %s, with no text in its place, when no blockedReplyText is configured", async (_name, answer) => {
+    const { hooks } = setup({ reply: replyAnswer(answer), blockedReplyText: null });
+    await startRun(hooks);
+    expect(await hooks.messageSending({ to: SENDER, content: "Pay at https://pay.example.net" }, MESSAGE_CTX)).toEqual({ cancel: true });
+  });
+
+  it("sends the Guardian's rewrite of a reply", async () => {
+    const { hooks } = setup({
+      reply: replyAnswer({ decision: { decision: "modify", reasoning: "masked", modifications: { redactions: [{ path: "/content/0/value", replacement: "The one-time code is ****." }] } } }),
+      blockedReplyText: null,
+    });
+    await startRun(hooks);
+    expect(await hooks.messageSending({ to: SENDER, content: "The one-time code is 4321." }, MESSAGE_CTX)).toEqual({ content: "The one-time code is ****." });
+  });
+
+  it("cancels a reply whose rewrite leaves anything but text, audited as modifications_invalid", async () => {
+    const { hooks, audit } = setup({
+      reply: replyAnswer({ decision: { decision: "modify", reasoning: "odd", modifications: { parameter_overrides: { content: [{ type: "image" }] } } } }),
+      blockedReplyText: null,
+    });
+    await startRun(hooks);
+    expect(await hooks.messageSending({ to: SENDER, content: "hi" }, MESSAGE_CTX)).toEqual({ cancel: true });
+    expect(audit).toContainEqual(expect.objectContaining({ outcome: "substituted", substituted: { decision: "modify", reason_code: "modifications_invalid" } }));
+  });
+
+  it("refuses a run with no text in its place when no blockedReplyText is configured", async () => {
+    const { hooks } = setup({ reply: () => ({ decision: { decision: "deny", reasoning: "not today" } }), blockedReplyText: null });
+    expect(await hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, AGENT_CTX)).toEqual({ outcome: "block", reason: "not today" });
   });
 
   it.each([
@@ -702,8 +787,8 @@ describe("message_sending", () => {
     const { server, hooks } = setup();
     await startRun(hooks);
     await hooks.agentEnd({ runId: "run-1" }, AGENT_CTX);
-    expect(await hooks.messageSending({ to: SENDER, content: "The host: the technician comes at 15:00" }, MESSAGE_CTX)).toEqual({
-      content: "The host: the technician comes at 15:00",
+    expect(await hooks.messageSending({ to: SENDER, content: "Reminder: the call starts at 15:00" }, MESSAGE_CTX)).toEqual({
+      content: "Reminder: the call starts at 15:00",
     });
     expect(server.steps.at(-1)).toMatchObject({ method: "steps/agentResponse", userContext: { user_id: SENDER } });
   });
@@ -715,6 +800,7 @@ const OWNER_KEY = `agent:main:signal:direct:${OWNER}`;
 const OWNER_AGENT_CTX = { runId: "run-o", sessionKey: OWNER_KEY, sessionId: "session-o", senderId: OWNER, channel: "signal" };
 const OWNER_TOOL_CTX = { runId: "run-o", sessionKey: OWNER_KEY };
 const THIRD_PHONE = "+15550177";
+const REPLY_CONTEXT = "The sender requests the proposed reply.";
 
 /** A call of OpenClaw's `message` tool; OpenClaw files its delivery under the recipient's session. */
 function sendCall(hooks: Hooks, params: Record<string, unknown>, ctx: Record<string, unknown> = TOOL_CTX, toolCallId = "call-1") {
@@ -726,7 +812,7 @@ function deliver(hooks: Hooks, to: string, content: string, ctx: { channelId: st
 }
 
 describe("message tool: a send to another recipient is the Guardian's to decide, at the call", () => {
-  const FORWARD = { action: "send", target: OWNER, message: "The sender attached a screenshot of the error. Suggested answer: a fix ships at 15:00." };
+  const FORWARD = { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "The sender attached a screenshot of the error. Suggested answer: a fix ships at 15:00." };
 
   it("forwards from a sender's session to the owner, decided once as the sender's call", async () => {
     const { server, hooks } = setup();
@@ -748,19 +834,37 @@ describe("message tool: a send to another recipient is the Guardian's to decide,
     await startRun(hooks);
     await hooks.agentEnd({ runId: "run-1" }, AGENT_CTX);
     expect(await hooks.beforeAgentRun({ prompt: "Tell the sender the fix ships at 15:00", senderId: OWNER }, OWNER_AGENT_CTX)).toBeUndefined();
-    const params = { action: "send", target: SENDER, message: "The fix ships at 15:00." };
+    const params = { action: "send", replyContext: REPLY_CONTEXT, target: SENDER, message: "The fix ships at 15:00." };
     expect(await sendCall(hooks, params, OWNER_TOOL_CTX)).toEqual({ params });
     expect(await deliver(hooks, SENDER, params.message, MESSAGE_CTX)).toEqual({ content: params.message });
     expect(server.steps.at(-1)).toMatchObject({ method: "steps/toolCallRequest", turnId: "run-o", userContext: { user_id: OWNER } });
   });
 
+  it("shows the host-origin message recipient in native approval scope", async () => {
+    const { hooks } = setup({ reply: toolDecision({
+      decision: "ask",
+      reasoning: "review the external message",
+      ask_details: { approver: { type: "human", id: "approver-1" }, question: "Send this?", timeout_seconds: 60 },
+    }) });
+    expect(await hooks.beforeAgentRun({ prompt: "Tell the sender the update", senderId: OWNER }, OWNER_AGENT_CTX)).toBeUndefined();
+
+    const result = await sendCall(hooks, { action: "send", target: SENDER, message: "The update is ready.", replyContext: REPLY_CONTEXT }, OWNER_TOOL_CTX);
+
+    expect(result?.requireApproval?.scope).toEqual({
+      kind: "message-send",
+      target: "signal",
+      recipientCount: 1,
+      recipients: [SENDER],
+    });
+  });
+
   it("delivers to every recipient a multi-target call names, and to no other", async () => {
     const { hooks } = setup();
     await startRun(hooks);
-    await sendCall(hooks, { action: "broadcast", targets: [OWNER, ` ${THIRD_PHONE} `], message: "Checkout moved to 11:00." });
-    expect(await deliver(hooks, OWNER, "Checkout moved to 11:00.")).toEqual({ content: "Checkout moved to 11:00." });
-    expect(await deliver(hooks, THIRD_PHONE, "Checkout moved to 11:00.")).toEqual({ content: "Checkout moved to 11:00." });
-    expect(await deliver(hooks, "+15550166", "Checkout moved to 11:00.")).toEqual({ cancel: true });
+    await sendCall(hooks, { action: "broadcast", targets: [OWNER, ` ${THIRD_PHONE} `], message: "The call moved to 11:00." });
+    expect(await deliver(hooks, OWNER, "The call moved to 11:00.")).toEqual({ content: "The call moved to 11:00." });
+    expect(await deliver(hooks, THIRD_PHONE, "The call moved to 11:00.")).toEqual({ content: "The call moved to 11:00." });
+    expect(await deliver(hooks, "+15550166", "The call moved to 11:00.")).toEqual({ cancel: true });
   });
 
   it("delivers to the recipient a Guardian's modify put into the call", async () => {
@@ -768,8 +872,8 @@ describe("message tool: a send to another recipient is the Guardian's to decide,
       reply: toolDecision({ decision: "modify", reasoning: "to the owner only", modifications: { parameter_overrides: { target: OWNER } } }),
     });
     await startRun(hooks);
-    expect(await sendCall(hooks, { action: "send", target: THIRD_PHONE, message: "hi" })).toEqual({
-      params: { action: "send", target: OWNER, message: "hi" },
+    expect(await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: THIRD_PHONE, message: "hi" })).toEqual({
+      params: { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "hi" },
     });
     expect(await deliver(hooks, THIRD_PHONE, "hi")).toEqual({ cancel: true });
     expect(await deliver(hooks, OWNER, "hi")).toEqual({ content: "hi" });
@@ -796,7 +900,7 @@ describe("message tool: a send to another recipient is the Guardian's to decide,
     await startRun(hooks);
     await sendCall(hooks, FORWARD);
     const before = server.steps.length;
-    expect(await deliver(hooks, OWNER, `${FORWARD.message} And the door code is 4321.`)).toEqual({ cancel: true });
+    expect(await deliver(hooks, OWNER, `${FORWARD.message} And the one-time code is 4321.`)).toEqual({ cancel: true });
     expect(server.steps).toHaveLength(before);
   });
 
@@ -857,8 +961,8 @@ describe("message tool: a send to another recipient is the Guardian's to decide,
     const otherCtx = { runId: "run-g", sessionKey: `agent:main:signal:direct:${otherSender}`, sessionId: "session-g", senderId: otherSender, channel: "signal" };
     await startRun(hooks);
     expect(await hooks.beforeAgentRun({ prompt: "Hello", senderId: otherSender }, otherCtx)).toBeUndefined();
-    await sendCall(hooks, { action: "send", target: OWNER, message: "From the first sender" });
-    await sendCall(hooks, { action: "send", target: OWNER, message: "From the second sender" }, { runId: "run-g", sessionKey: otherCtx.sessionKey }, "call-2");
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "From the first sender" });
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "From the second sender" }, { runId: "run-g", sessionKey: otherCtx.sessionKey }, "call-2");
 
     expect(await deliver(hooks, OWNER, "From the second sender")).toEqual({ content: "From the second sender" });
     expect(await deliver(hooks, OWNER, "From the first sender")).toEqual({ content: "From the first sender" });
@@ -866,16 +970,113 @@ describe("message tool: a send to another recipient is the Guardian's to decide,
     expect(server.steps.some((step) => step.method === "steps/agentResponse")).toBe(false);
   });
 
-  it("keeps a reply in the session's own chat on the session's path: a refusal sends the fixed text", async () => {
-    const { hooks } = setup({ reply: replyAnswer({ decision: { decision: "deny", reasoning: "no" } }) });
+  // OpenClaw trims the tool's text (`parseInlineDirectives`) and collapses blank
+  // lines (`sanitizeForPlainText`) before `message_sending`.
+  it("delivers under the grant the call's words as OpenClaw re-spaces them", async () => {
+    const { server, hooks } = setup();
     await startRun(hooks);
-    await sendCall(hooks, { action: "send", target: SENDER, message: "hi" });
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "\n  The call moved to 11:00.\n\n\n\nThe one-time code is 4321.\n" });
+    const delivered = "The call moved to 11:00.\n\nThe one-time code is 4321.";
+    expect(await deliver(hooks, OWNER, delivered)).toEqual({ content: delivered });
+    expect(server.steps.map((step) => step.method)).toEqual(["steps/userMessage", "steps/toolCallRequest"]);
+  });
+
+  it.each([
+    ["a_word_more", "The call moved to 11:00. The one-time code is 4321. Bring cash."],
+    ["a_word_less", "The call moved to 11:00. The one-time code is"],
+    ["a_word_split", "The call moved to 11:00. The one-time code is 43 21."],
+  ])("sends nothing when the delivered text has %s than the call's", async (_name, delivered) => {
+    const { hooks } = setup();
+    await startRun(hooks);
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "The call moved to 11:00. The one-time code is 4321." });
+    expect(await deliver(hooks, OWNER, delivered)).toEqual({ cancel: true });
+  });
+});
+
+describe("message tool: a send to the session's own sender is the call's action", () => {
+  /** Denies every reply at `steps/agentResponse` and answers every tool call with `decision`. */
+  const decidedAtTheCall = (decision: Record<string, unknown>) => (step: ReceivedStep): Reply =>
+    step.method === "steps/agentResponse"
+      ? { decision: { decision: "deny", reasoning: "a person gets only what a message call sent" } }
+      : step.method === "steps/toolCallRequest"
+        ? { decision }
+        : { decision: { decision: "allow" } };
+  const ASK_DECISION = { decision: "ask", reasoning: "r", ask_details: { approver: { type: "human", id: "approver-1" }, question: "Send?", timeout_seconds: 60 } };
+  const methods = (server: FakeAcsServer) => server.steps.map((step) => step.method);
+
+  it.each([
+    ["names_the_sender", { action: "send", replyContext: REPLY_CONTEXT, target: SENDER, message: "The call is at 15:00." }],
+    ["names_no_recipient", { action: "send", replyContext: REPLY_CONTEXT, message: "The call is at 15:00." }],
+    ["names_no_recipient_on_the_runs_channel", { action: "send", replyContext: REPLY_CONTEXT, channel: "signal", message: "The call is at 15:00." }],
+  ])("delivers an allowed call that %s under its grant, without a steps/agentResponse", async (_name, params) => {
+    const { server, hooks } = setup({ reply: decidedAtTheCall({ decision: "allow" }), blockedReplyText: null });
+    await startRun(hooks);
+    expect(await sendCall(hooks, params)).toEqual({ params });
+    expect(await deliver(hooks, SENDER, "The call is at 15:00.", MESSAGE_CTX)).toEqual({ content: "The call is at 15:00." });
+    expect(methods(server)).toEqual(["steps/userMessage", "steps/toolCallRequest"]);
+  });
+
+  it("delivers a call a person approved under its grant, without a steps/agentResponse", async () => {
+    const { server, hooks } = setup({ reply: decidedAtTheCall(ASK_DECISION), blockedReplyText: null });
+    await startRun(hooks);
+    const result = await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Your refund is on its way." });
+    await result!.requireApproval!.onResolution!("allow-once");
+    expect(await deliver(hooks, SENDER, "Your refund is on its way.", MESSAGE_CTX)).toEqual({ content: "Your refund is on its way." });
+    expect(methods(server)).toEqual(["steps/userMessage", "steps/toolCallRequest"]);
+  });
+
+  it("delivers an approved answer that OpenClaw trims on the way under its grant, without a steps/agentResponse", async () => {
+    const { server, hooks } = setup({ reply: decidedAtTheCall(ASK_DECISION), blockedReplyText: null });
+    await startRun(hooks);
+    const result = await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Your refund is on its way.\n" });
+    await result!.requireApproval!.onResolution!("allow-once");
+    expect(await deliver(hooks, SENDER, "Your refund is on its way.", MESSAGE_CTX)).toEqual({ content: "Your refund is on its way." });
+    expect(methods(server)).toEqual(["steps/userMessage", "steps/toolCallRequest"]);
+  });
+
+  it("grants nothing to a call that names no recipient on another channel", async () => {
+    const { server, hooks } = setup({ reply: decidedAtTheCall({ decision: "allow" }), blockedReplyText: null });
+    await startRun(hooks);
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, channel: "sms", message: "hi" });
+    expect(await deliver(hooks, SENDER, "hi", MESSAGE_CTX)).toEqual({ cancel: true });
+    expect(methods(server).at(-1)).toBe("steps/agentResponse");
+  });
+
+  it("sends the text OpenClaw writes after a denied call as steps/agentResponse, and on deny cancels it with no text in its place", async () => {
+    const { server, hooks, audit } = setup({ reply: decidedAtTheCall({ decision: "deny", reasoning: "not before the host answers" }), blockedReplyText: null });
+    await startRun(hooks);
+    expect(await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Your refund is on its way." })).toMatchObject({ block: true });
+    expect(await deliver(hooks, SENDER, "I could not send that; the host will answer you.", MESSAGE_CTX)).toEqual({ cancel: true });
+    expect(server.steps.at(-1)).toMatchObject({
+      method: "steps/agentResponse",
+      userContext: { user_id: SENDER, authentication_method: "signal" },
+      payload: { content: [{ type: "text", value: "I could not send that; the host will answer you." }] },
+    });
+    expect(audit).toEqual([]);
+  });
+
+  it.each<"deny" | "timeout" | "cancelled">(["deny", "timeout", "cancelled"])(
+    "sends the text OpenClaw writes after an approval's %s as steps/agentResponse, and on deny cancels it",
+    async (resolution) => {
+      const { server, hooks } = setup({ reply: decidedAtTheCall(ASK_DECISION), blockedReplyText: null });
+      await startRun(hooks);
+      const result = await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Your refund is on its way." });
+      await result!.requireApproval!.onResolution!(resolution);
+      expect(await deliver(hooks, SENDER, "Your refund is on its way.", MESSAGE_CTX)).toEqual({ cancel: true });
+      expect(methods(server).at(-1)).toBe("steps/agentResponse");
+    },
+  );
+
+  it("sends a configured blockedReplyText in place of the denied delivery", async () => {
+    const { hooks } = setup({ reply: decidedAtTheCall({ decision: "deny", reasoning: "no" }) });
+    await startRun(hooks);
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "hi" });
     expect(await deliver(hooks, SENDER, "hi", MESSAGE_CTX)).toEqual({ content: BLOCKED });
   });
 });
 
 describe("message tool: a grant covers only the send the Guardian saw", () => {
-  const FORWARD = { action: "send", target: OWNER, message: "Screenshot of the error" };
+  const FORWARD = { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "Screenshot of the error" };
 
   it("sends a sender's forward to an owner with an admitted session as the sender's, not as the owner's own reply", async () => {
     const { server, hooks } = setup();
@@ -938,14 +1139,14 @@ describe("message tool: an approval covers one recipient and one text", () => {
     reasoning: "a sender's screenshot goes to the owner",
     ask_details: { approver: { type: "human", id: "approver-1" }, question: "Forward it?", timeout_seconds: 60 },
   });
-  const PARAMS = { action: "send", target: OWNER, message: "Screenshot of the error" };
+  const PARAMS = { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "Screenshot of the error" };
 
   it("shows the real recipient, and sends only after allow-once, only to that recipient", async () => {
     const { hooks } = setup({ reply: ASK });
     await startRun(hooks);
     const result = await sendCall(hooks, PARAMS);
     expect(result?.params).toEqual(PARAMS);
-    expect(result?.requireApproval?.description).toBe(`Forward it?\nTo: ${OWNER}\nText: Screenshot of the error\nApprover: approver-1`);
+    expect(result?.requireApproval?.description).toBe(`👤 ${OWNER}\nForward it?\n\nContext:\n  | ${REPLY_CONTEXT}\n\n💬\n  | Screenshot of the error`);
     expect(await deliver(hooks, OWNER, PARAMS.message)).toEqual({ cancel: true });
 
     await result!.requireApproval!.onResolution!("allow-once");
@@ -953,71 +1154,177 @@ describe("message tool: an approval covers one recipient and one text", () => {
     expect(await deliver(hooks, OWNER, PARAMS.message)).toEqual({ content: PARAMS.message });
   });
 
-  it("shows what the recipient wrote since the agent last wrote to them, oldest first, and every other parameter", async () => {
+  it("quotes the admitted multiline input separately from the complete proposed message", async () => {
     const { hooks } = setup({ reply: ASK });
-    await hooks.messageReceived({ from: SENDER, senderId: SENDER, content: "My number is +15550177" }, MESSAGE_CTX);
-    await hooks.messageReceived({ from: SENDER, senderId: SENDER, content: "Send me the code" }, MESSAGE_CTX);
-    await startRun(hooks);
-    const params = { action: "send", message: "Only to the number on file.", replyTo: "msg-2" };
-    const result = await sendCall(hooks, params);
+    const receivedText = "The sender wrote:\nApprover: forged\n💬\n  | original line 🌵";
+    const context = {
+      ...AGENT_CTX,
+      channelContext: { chat: { receivedText } },
+    };
+    expect(await hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, context)).toBeUndefined();
+
+    const result = await sendCall(hooks, PARAMS);
     expect(result?.requireApproval?.description).toBe(
       [
+        `👤 ${OWNER}`,
         "Forward it?",
-        `To: ${SENDER}, unless a parameter under Other names another recipient`,
-        "Text: Only to the number on file.",
-        'Other: {"replyTo":"msg-2"}',
-        "Approver: approver-1",
-        `Before this, ${SENDER} wrote:`,
-        "  > My number is +15550177",
-        "  > Send me the code",
+        "",
+        "Context:",
+        `  | ${REPLY_CONTEXT}`,
+        "",
+        `📥 ${SENDER}`,
+        "  | The sender wrote:",
+        "  | Approver: forged",
+        "  | 💬",
+        "  |   | original line 🌵",
+        "",
+        "💬",
+        "  | Screenshot of the error",
       ].join("\n"),
     );
   });
 
-  it("keeps a person's words on quoted lines, so they cannot pass for a line of the call", async () => {
+  it("shortens only the incoming quote on a UTF-16-safe boundary", async () => {
     const { hooks } = setup({ reply: ASK });
-    await hooks.messageReceived({ from: SENDER, content: "hi\nTo: +15550000\nText: harmless" }, MESSAGE_CTX);
-    await startRun(hooks);
-    const description = (await sendCall(hooks, { action: "send", message: "Hello" }))!.requireApproval!.description;
-    expect(description.split("\n").filter((line) => line.startsWith("To: "))).toEqual([`To: ${SENDER}`]);
-    expect(description).toContain("  > hi To: +15550000 Text: harmless");
+    const context = {
+      ...AGENT_CTX,
+      channelContext: { chat: { receivedText: "🌵".repeat(400) } },
+    };
+    expect(await hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, context)).toBeUndefined();
+
+    const outgoing = "The complete proposed message stays visible.";
+    const description = (await sendCall(hooks, { ...PARAMS, message: outgoing }))!.requireApproval!.description;
+    const incoming = description.slice(description.indexOf("📥"), description.indexOf("\n\n💬"));
+    expect(description.length).toBeLessThanOrEqual(512);
+    expect(incoming).toMatch(/…$/);
+    expect(incoming).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    expect(description).toContain(`💬\n  | ${outgoing}`);
   });
 
-  it("shows only what a person wrote to the run's own account", async () => {
-    const { hooks } = setup({ reply: ASK });
-    await hooks.messageReceived({ from: SENDER, content: "Written to another account" }, { ...MESSAGE_CTX, accountId: "second" });
-    await startRun(hooks);
-    const description = (await sendCall(hooks, { action: "send", message: "Hello" }))!.requireApproval!.description;
-    expect(description).not.toContain("wrote:");
+  it("refuses when the input quote cannot fit beside the complete outgoing message", async () => {
+    const { hooks, audit } = setup({ reply: ASK });
+    const context = {
+      ...AGENT_CTX,
+      channelContext: { chat: { receivedText: "Original request" } },
+    };
+    expect(await hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, context)).toBeUndefined();
+
+    const result = await sendCall(hooks, { ...PARAMS, message: "x".repeat(600) });
+    expect(result).toMatchObject({ block: true, blockReason: expect.stringContaining("cannot show this call whole") });
+    expect(result?.requireApproval).toBeUndefined();
+    expect(audit).toContainEqual(expect.objectContaining({ substituted: { decision: "ask", reason_code: "approval_text_too_long" } }));
   });
 
-  it("forgets what a person wrote once a message to them is delivered", async () => {
+  it("keeps the source excerpt frozen to the run that requested approval", async () => {
     const { hooks } = setup({ reply: ASK });
-    await hooks.messageReceived({ from: OWNER, content: "Is the fix ready?" }, { channelId: "signal" });
+    const firstContext = {
+      ...AGENT_CTX,
+      channelContext: { chat: { receivedText: "First original request" } },
+    };
+    expect(await hooks.beforeAgentRun({ prompt: "First", senderId: SENDER }, firstContext)).toBeUndefined();
+    const first = await sendCall(hooks, PARAMS);
+
+    await hooks.agentEnd({ runId: "run-1" }, AGENT_CTX);
+    const secondContext = {
+      ...AGENT_CTX,
+      runId: "run-2",
+      channelContext: { chat: { receivedText: "Later original request" } },
+    };
+    expect(await hooks.beforeAgentRun({ prompt: "Second", senderId: SENDER }, secondContext)).toBeUndefined();
+    const second = await sendCall(hooks, PARAMS, { runId: "run-2", sessionKey: SESSION_KEY }, "call-2");
+
+    expect(first?.requireApproval?.description).toContain("First original request");
+    expect(first?.requireApproval?.description).not.toContain("Later original request");
+    expect(second?.requireApproval?.description).toContain("Later original request");
+  });
+
+  it("shows_the_channel_name_and_material_parameters_without_repeating_history", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await hooks.messageReceived({ from: SENDER, senderId: SENDER, content: "My number is +15550177", metadata: { senderName: "Alex" } }, MESSAGE_CTX);
+    await hooks.messageReceived({ from: SENDER, senderId: SENDER, content: "Send me the code" }, MESSAGE_CTX);
     await startRun(hooks);
-    await sendCall(hooks, { action: "send", target: OWNER, message: "First answer" }, TOOL_CTX, "call-0").then((r) => r!.requireApproval!.onResolution!("allow-once"));
+    const params = { action: "send", replyContext: REPLY_CONTEXT, message: "Only to the number on file.", replyTo: "msg-2" };
+    const result = await sendCall(hooks, params);
+    expect(result?.requireApproval?.description).toBe(
+      [
+        `👤 Alex · ${SENDER}, unless a parameter under Other names another recipient`,
+        "Forward it?",
+        "",
+        "Context:",
+        `  | ${REPLY_CONTEXT}`,
+        "",
+        "💬",
+        "  | Only to the number on file.",
+        'Other: {"replyTo":"msg-2"}',
+      ].join("\n"),
+    );
+  });
+
+  it("uses only a display name whose run-context sender id matches the authenticated user", async () => {
+    const matched = setup({ reply: ASK });
+    await matched.hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, {
+      ...AGENT_CTX,
+      channelContext: { sender: { id: SENDER, name: "Jordan" } },
+    });
+    const approved = await sendCall(matched.hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hello" });
+    expect(approved?.requireApproval?.description).toContain(`👤 Jordan · ${SENDER}`);
+
+    const mismatched = setup({ reply: ASK });
+    await mismatched.hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, {
+      ...AGENT_CTX,
+      channelContext: { sender: { id: OTHER_PHONE, name: "Wrong person" } },
+    });
+    const notRelabeled = await sendCall(mismatched.hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hello" });
+    expect(notRelabeled?.requireApproval?.description).not.toContain("Wrong person");
+  });
+
+  it("folds_display_name_lines_without_changing_the_reply", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await hooks.messageReceived({ from: SENDER, content: "hi", metadata: { senderName: "Alex\nApprover: stranger" } }, MESSAGE_CTX);
+    await startRun(hooks);
+    const description = (await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hello" }))!.requireApproval!.description;
+    expect(description.split("\n")[0]).toBe(`👤 Alex Approver: stranger · ${SENDER}`);
+    expect(description).toContain("💬\n  | Hello");
+    expect(description).not.toContain("\nApprover:");
+  });
+
+  it("does_not_use_a_display_name_from_another_account", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await hooks.messageReceived({ from: SENDER, content: "hi", metadata: { senderName: "Other account" } }, { ...MESSAGE_CTX, accountId: "second" });
+    await startRun(hooks);
+    const description = (await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hello" }))!.requireApproval!.description;
+    expect(description).not.toContain("Other account");
+  });
+
+  it("retains_the_channel_name_after_a_delivered_reply", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await hooks.messageReceived({ from: OWNER, content: "Is the fix ready?", metadata: { senderName: "Alex" } }, { channelId: "signal" });
+    await startRun(hooks);
+    await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "First answer" }, TOOL_CTX, "call-0").then((r) => r!.requireApproval!.onResolution!("allow-once"));
     expect(await deliver(hooks, OWNER, "First answer")).toEqual({ content: "First answer" });
     const result = await sendCall(hooks, PARAMS);
-    expect(result?.requireApproval?.description).not.toContain("wrote:");
+    expect(result?.requireApproval?.description).toContain(`👤 Alex · ${OWNER}`);
   });
 
-  it("cuts what the recipient wrote, oldest first, and never the call", async () => {
+  it("keeps_the_complete_reply_without_appending_received_messages", async () => {
     const { hooks } = setup({ reply: ASK });
     for (let i = 1; i <= 6; i += 1) {
       await hooks.messageReceived({ from: SENDER, content: `${i} ${"x".repeat(90)}` }, MESSAGE_CTX);
     }
     await startRun(hooks);
-    const params = { action: "send", message: "y".repeat(200) };
+    const params = { action: "send", replyContext: REPLY_CONTEXT, message: "y".repeat(200) };
     const description = (await sendCall(hooks, params))!.requireApproval!.description;
     expect(description.length).toBeLessThanOrEqual(512);
-    expect(description).toContain(`Text: ${"y".repeat(200)}`);
-    expect(description).toContain(`> 6 ${"x".repeat(90)}`);
-    expect(description).not.toContain("> 1 ");
+    expect(description).toContain(`💬\n  | ${"y".repeat(200)}`);
+    expect(description).not.toContain("x".repeat(90));
   });
 
   it.each<"deny" | "timeout" | "cancelled">(["deny", "timeout", "cancelled"])("sends nothing after %s", async (resolution) => {
     const { hooks } = setup({ reply: ASK });
-    await startRun(hooks);
+    await hooks.beforeAgentRun(
+      { prompt: "Hello", senderId: SENDER },
+      { ...AGENT_CTX, channelContext: { chat: { receivedText: "The original request" } } },
+    );
     const result = await sendCall(hooks, PARAMS);
     await result!.requireApproval!.onResolution!(resolution);
     expect(await deliver(hooks, OWNER, PARAMS.message)).toEqual({ cancel: true });
@@ -1430,14 +1737,18 @@ describe("before_dispatch: a message that joins a running turn is the Guardian's
     });
   });
 
-  it("drops a message the Guardian refuses, with the fixed text", async () => {
+  it.each<[string, string | null, BeforeDispatchResult]>([
+    ["with_the_configured_text", BLOCKED, { handled: true, text: BLOCKED }],
+    ["with_no_text_when_none_is_configured", null, { handled: true }],
+  ])("drops a message the Guardian refuses, %s", async (_name, blockedReplyText, expected) => {
     const { hooks } = setup({
       reply: (step) => (step.method === "steps/userMessage" && (step.payload as { content: Array<{ value: string }> }).content[0]!.value === STEER.content
         ? { decision: { decision: "deny", reasoning: "no" } }
         : { decision: { decision: "allow" } }),
+      blockedReplyText,
     });
     await startRun(hooks);
-    expect(await hooks.beforeDispatch(STEER, DISPATCH_CTX)).toEqual({ handled: true, text: BLOCKED });
+    expect(await hooks.beforeDispatch(STEER, DISPATCH_CTX)).toEqual(expected);
   });
 
   it("drops a message from another sender than the running turn's", async () => {
@@ -1561,20 +1872,191 @@ describe("before_dispatch: no message slips into a run nobody decided it for", (
 describe("approval prompt: what the approver reads is what goes out", () => {
   const ASK = toolDecision({ decision: "ask", reasoning: "check", ask_details: { approver: { type: "human", id: "approver-1" }, question: "Send it?", timeout_seconds: 60 } });
 
+  it.each([undefined, "", "   ", "\n\t", null, 42, {}, []].map((replyContext) => ({ replyContext })))("requires a nonempty string summary on ask: $replyContext", async ({ replyContext }) => {
+    const { hooks, audit } = setup({ reply: ASK, blockedReplyText: null });
+    await startRun(hooks);
+    const params = { action: "send", target: OWNER, message: "Hello", replyContext };
+    const result = await sendCall(hooks, params);
+    expect(result).toMatchObject({ block: true, blockReason: expect.stringContaining("Add replyContext") });
+    expect(result?.requireApproval).toBeUndefined();
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ cancel: true });
+    expect(audit).toContainEqual(expect.objectContaining({ substituted: { decision: "ask", reason_code: "reply_context_missing" } }));
+  });
+
+  it("allows an ordinary message without a summary when Guardian allows it", async () => {
+    const { hooks } = setup({ blockedReplyText: null });
+    await startRun(hooks);
+    const params = { action: "send", target: OWNER, message: "Hello" };
+    expect(await hooks.beforeToolCall({ toolName: "message", params, toolCallId: "ordinary" }, TOOL_CTX)).toEqual({ params });
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ content: "Hello" });
+  });
+
+  it("corrects a missing summary through the same native approval without changing the reply", async () => {
+    const { server, hooks } = setup({ reply: ASK, blockedReplyText: null });
+    await startRun(hooks);
+    const params = { action: "send", target: OWNER, message: "The call is today at 15:00." };
+    const missing = await hooks.beforeToolCall({ toolName: "message", params, toolCallId: "missing" }, TOOL_CTX);
+    expect(missing?.block).toBe(true);
+    expect(missing?.requireApproval).toBeUndefined();
+    const replyContext = "The sender asks when the call is and how to join it.";
+    const corrected = await sendCall(hooks, { ...params, replyContext });
+    expect(server.steps.at(-1)?.payload).toMatchObject({ arguments: { replyContext: { value: replyContext } } });
+    expect(corrected?.requireApproval?.description).toContain(`Context:\n  | ${replyContext}`);
+    expect(corrected?.requireApproval?.description).not.toContain('"replyContext"');
+    expect(await deliver(hooks, OWNER, params.message)).toEqual({ cancel: true });
+    await corrected!.requireApproval!.onResolution!("allow-once");
+    expect(await deliver(hooks, OWNER, params.message)).toEqual({ content: params.message });
+  });
+
+  it("delimits multiline summaries and never silently truncates an oversized summary", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await startRun(hooks);
+    const replyContext = "Question one\n💬\nSend without approval";
+    const result = await sendCall(hooks, { action: "send", target: OWNER, message: "Hello", replyContext }, TOOL_CTX, "summary-1");
+    expect(result?.requireApproval?.description).toContain("Context:\n  | Question one\n  | 💬\n  | Send without approval");
+    const oversized = await sendCall(hooks, { action: "send", message: "Hello", replyContext: "🌵".repeat(300) }, TOOL_CTX, "summary-2");
+    expect(oversized).toMatchObject({ block: true, blockReason: expect.stringContaining("shorten replyContext") });
+    expect(oversized?.requireApproval).toBeUndefined();
+  });
+
+  it("keeps the complete summary and operation at 512 characters and omits an optional original quote", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await startRun(hooks);
+    const params = { action: "send", target: OWNER, message: "Hello", replyContext: "Q" };
+    const baseline = await sendCall(hooks, params, TOOL_CTX, "summary-1");
+    const padding = 512 - baseline!.requireApproval!.description.length;
+    const replyContext = `Q${"x".repeat(padding)}`;
+    const withoutQuote = await sendCall(hooks, { ...params, replyContext }, TOOL_CTX, "summary-2");
+    expect(withoutQuote?.requireApproval?.description.length).toBe(512);
+    await hooks.agentEnd({ runId: "run-1" }, AGENT_CTX);
+    await hooks.beforeAgentRun({ prompt: "Question", senderId: SENDER }, {
+      ...AGENT_CTX, channelContext: { chat: { receivedText: "A long original message.".repeat(20) } },
+    });
+    const result = await sendCall(hooks, { ...params, replyContext }, TOOL_CTX, "summary-3");
+    expect(result?.requireApproval?.description).toBe(withoutQuote?.requireApproval?.description);
+    expect(result?.requireApproval?.description).toContain(replyContext);
+    expect(result?.requireApproval?.description).toContain("💬\n  | Hello");
+    const oversized = await sendCall(hooks, { ...params, replyContext: `${replyContext}x` });
+    expect(oversized?.block).toBe(true);
+    expect(oversized?.requireApproval).toBeUndefined();
+  });
+
+  it("uses the same summary contract for an upload approval without treating metadata as delivery content", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await startRun(hooks);
+    const params = { action: "upload-file", target: OWNER, media: "https://example.com/photo.jpg", replyContext: "The sender requests the photograph." };
+    const result = await sendCall(hooks, params);
+    expect(result?.params).toEqual(params);
+    expect(result?.requireApproval?.description).toContain(`Context:\n  | ${params.replyContext}`);
+    expect(result?.requireApproval?.description).toContain('"action":"upload-file"');
+    expect(result?.requireApproval?.description).not.toContain('"replyContext"');
+  });
+
+  it("acknowledges_a_requested_approval_only_in_the_frozen_approved_call", async () => {
+    const { server, hooks } = setup({ reply: ASK, blockedReplyText: null });
+    await startRun(hooks);
+    const params = { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "Hello", requestApproval: true };
+    const result = await sendCall(hooks, params);
+    expect(server.steps.at(-1)?.payload).toMatchObject({ arguments: { requestApproval: { value: true }, message: { value: "Hello" } } });
+    expect(params.requestApproval).toBe(true);
+    expect(result?.params).toEqual({ ...params, requestApproval: false });
+    expect(result?.requireApproval?.description).toContain("💬\n  | Hello");
+    expect(result?.requireApproval?.description).not.toContain("requestApproval");
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ cancel: true });
+    await result!.requireApproval!.onResolution!("allow-once");
+    expect(await deliver(hooks, OWNER, "Changed")).toEqual({ cancel: true });
+    expect(await deliver(hooks, THIRD_PHONE, "Hello")).toEqual({ cancel: true });
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ content: "Hello" });
+    await hooks.afterToolCall({ toolName: "message", toolCallId: "call-1" }, TOOL_CTX);
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ cancel: true });
+  });
+
+  it.each(["deny", "timeout", "cancelled"] as const)("does_not_deliver_a_requested_approval_after_%s", async (resolution) => {
+    const { hooks } = setup({ reply: ASK, blockedReplyText: null });
+    await startRun(hooks);
+    const result = await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "Hello", requestApproval: true });
+    await result!.requireApproval!.onResolution!(resolution);
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ cancel: true });
+  });
+
+  it("leaves_an_unhandled_request_for_the_channel_policy", async () => {
+    const { hooks } = setup();
+    await startRun(hooks);
+    const params = { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "Hello", requestApproval: true };
+    expect(await sendCall(hooks, params)).toEqual({ params });
+  });
+
+  it("does_not_change_a_different_tools_request_approval_argument", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await startRun(hooks);
+    const params = { requestApproval: true };
+    expect((await callTool(hooks, params))?.params).toEqual(params);
+  });
+
+  it("separates_channel_identity_guardian_context_and_exact_reply", async () => {
+    const { hooks } = setup({ reply: toolDecision({ decision: "ask", reasoning: "technical audit reason", ask_details: {
+      approver: { type: "human", id: "approver-1" }, question: "Owner approval required.",
+      context: "Order: Taylor, A-100, express delivery.", timeout_seconds: 60,
+    } }) });
+    await hooks.messageReceived({ from: SENDER, content: "hi", metadata: { senderName: "Alex" } }, MESSAGE_CTX);
+    await startRun(hooks);
+    const params = { action: "send", replyContext: REPLY_CONTEXT, message: "The call is today at 15:00.", final: true };
+    const result = await sendCall(hooks, params);
+    expect(result?.params).toEqual(params);
+    expect(result?.requireApproval?.description).toBe(`👤 Alex · ${SENDER}\nOwner approval required.\nOrder: Taylor, A-100, express delivery.\n\nContext:\n  | ${REPLY_CONTEXT}\n\n💬\n  | The call is today at 15:00.`);
+    expect(result?.requireApproval?.description).not.toContain("technical audit reason");
+  });
+
+  it("forgets_a_display_name_when_its_session_ends", async () => {
+    const { hooks } = setup({ reply: ASK });
+    await hooks.messageReceived({ from: SENDER, content: "hi", metadata: { senderName: "Alex" } }, MESSAGE_CTX);
+    await startRun(hooks);
+    await hooks.agentEnd({ runId: "run-1", success: true }, AGENT_CTX);
+    await hooks.sessionEnd({ sessionKey: SESSION_KEY, sessionId: SESSION_ID }, {});
+    await startRun(hooks);
+    expect((await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hello" }))?.requireApproval?.description).not.toContain("Alex");
+  });
+
+  it.each([
+    ["cleared_request", { requestApproval: false }],
+    ["changed_action", { action: "poll" }],
+    ["changed_channel", { channel: "telegram" }],
+    ["blank_channel_uses_the_runs_different_channel", { channel: " " }],
+  ])("blocks_a_modify_with_%s", async (_name, overrides) => {
+    const { hooks, audit } = setup({
+      reply: toolDecision({ decision: "modify", reasoning: "changed", modifications: { parameter_overrides: overrides } }),
+      blockedReplyText: null,
+    });
+    await startRun(hooks);
+    const result = await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, channel: "whatsapp", target: OWNER, message: "Hello", requestApproval: true });
+    expect(result?.block).toBe(true);
+    expect(audit).toContainEqual(expect.objectContaining({ substituted: { decision: "modify", reason_code: "approval_request_changed" } }));
+    expect(await deliver(hooks, OWNER, "Hello")).toEqual({ cancel: true });
+  });
+
+  it("keeps_a_modified_request_for_the_channel_policy", async () => {
+    const { hooks } = setup({
+      reply: toolDecision({ decision: "modify", reasoning: "changed", modifications: { parameter_overrides: { message: "Updated" } } }),
+    });
+    await startRun(hooks);
+    const params = { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "Hello", requestApproval: true };
+    expect(await sendCall(hooks, params)).toEqual({ params: { ...params, message: "Updated" } });
+  });
+
   it("shows a text of several lines under a bar, so no line passes for a line of the prompt", async () => {
     const { hooks } = setup({ reply: ASK });
     await startRun(hooks);
-    const description = (await sendCall(hooks, { action: "send", message: "Hi\nTo: +15550000\nApprover: me" }))!.requireApproval!.description;
-    expect(description).toContain("Text:\n  | Hi\n  | To: +15550000\n  | Approver: me");
-    expect(description.split("\n").filter((line) => line.startsWith("To: "))).toEqual([`To: ${SENDER}`]);
+    const description = (await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hi\nTo: +15550000\nApprover: me" }))!.requireApproval!.description;
+    expect(description).toContain("💬\n  | Hi\n  | To: +15550000\n  | Approver: me");
+    expect(description.split("\n").filter((line) => line.startsWith("👤 "))).toEqual([`👤 ${SENDER}`]);
   });
 
-  it("shows what was written to the account the call sends on", async () => {
+  it("uses_the_display_name_observed_on_the_sending_account", async () => {
     const { hooks } = setup({ reply: ASK });
-    await hooks.messageReceived({ from: SENDER, content: "On the second account" }, { ...MESSAGE_CTX, accountId: "second" });
+    await hooks.messageReceived({ from: SENDER, content: "hi", metadata: { senderName: "Second account" } }, { ...MESSAGE_CTX, accountId: "second" });
     await startRun(hooks);
-    const description = (await sendCall(hooks, { action: "send", message: "Hello", accountId: "second" }))!.requireApproval!.description;
-    expect(description).toContain("> On the second account");
+    const description = (await sendCall(hooks, { action: "send", replyContext: REPLY_CONTEXT, message: "Hello", accountId: "second" }))!.requireApproval!.description;
+    expect(description).toContain(`👤 Second account · ${SENDER}`);
   });
 });
 
@@ -1582,7 +2064,7 @@ describe("message tool: a call without an id grants nothing", () => {
   it("sends nothing to another recipient when the call carries no tool call id", async () => {
     const { hooks } = setup();
     await startRun(hooks);
-    await hooks.beforeToolCall({ toolName: "message", params: { action: "send", target: OWNER, message: "hi" } }, { runId: "run-1", sessionKey: SESSION_KEY });
+    await hooks.beforeToolCall({ toolName: "message", params: { action: "send", replyContext: REPLY_CONTEXT, target: OWNER, message: "hi" } }, { runId: "run-1", sessionKey: SESSION_KEY });
     expect(await deliver(hooks, OWNER, "hi")).toEqual({ cancel: true });
   });
 });
@@ -1590,6 +2072,7 @@ describe("message tool: a call without an id grants nothing", () => {
 describe("a tool's result reaches the model only as the Guardian decided it", () => {
   const RESULT_CTX = { runtime: "openclaw", runId: "run-1", sessionKey: SESSION_KEY, sessionId: SESSION_ID };
   const OUTPUT = "Balance: 120.00";
+  const WITHHELD = { result: { content: [{ type: "text" as const, text: WITHHELD_OUTPUT }] } };
   const resultDecision = (decision: Record<string, unknown>) => (step: ReceivedStep): Reply =>
     step.method === "steps/toolCallResult" ? { decision } : { decision: { decision: "allow" } };
 
@@ -1691,6 +2174,130 @@ describe("a tool's result reaches the model only as the Guardian decided it", ()
     expect(server.steps.at(-1)).toMatchObject({ method: "steps/toolCallResult", payload: { request_id_ref: request.requestId } });
   });
 
+  it("shares an approved call's run fact before a separate result registration reads it", async () => {
+    const runFacts = memoryRunFacts();
+    const ask = toolDecision({ decision: "ask", reasoning: "check", ask_details: { approver: { type: "human", id: "approver-1" }, question: "Allow?", timeout_seconds: 60 } });
+    const producer = setup({ methodsEvaluated: ALL_METHODS, runFacts, reply: ask });
+    const consumer = setup({ methodsEvaluated: ALL_METHODS, runFacts });
+    await startRun(producer.hooks);
+    const approval = await producer.hooks.beforeToolCall({ toolName: "account-lookup", params: {}, toolCallId: "call-1" }, TOOL_CTX);
+    expect(approval?.requireApproval).toBeDefined();
+
+    approval?.requireApproval?.onResolution?.("allow-once");
+    expect(await readResult(consumer.hooks)).toBeUndefined();
+
+    const toolRequest = producer.server.steps.find((step) => step.method === "steps/toolCallRequest")!;
+    expect(consumer.server.steps.at(-1)).toMatchObject({
+      method: "steps/toolCallResult",
+      turnId: "run-1",
+      payload: { exit_status: "success", request_id_ref: toolRequest.requestId },
+    });
+  });
+
+  it("shares admitted run and call authorization with a separately registered result middleware", async () => {
+    const runFacts = memoryRunFacts();
+    const producer = setup({ methodsEvaluated: ALL_METHODS, runFacts });
+    const consumer = setup({ methodsEvaluated: ALL_METHODS, runFacts });
+    await startRun(producer.hooks);
+    await producer.hooks.beforeToolCall({ toolName: "account-lookup", params: {}, toolCallId: "call-1" }, TOOL_CTX);
+
+    expect(await readResult(consumer.hooks)).toBeUndefined();
+    const toolRequest = producer.server.steps.find((step) => step.method === "steps/toolCallRequest")!;
+    expect(consumer.server.steps.at(-1)).toMatchObject({
+      method: "steps/toolCallResult",
+      turnId: "run-1",
+      sessionId: toolRequest.sessionId,
+      payload: { tool: { name: "account-lookup" }, exit_status: "success", request_id_ref: toolRequest.requestId },
+    });
+  });
+
+  it("withholds a result when the admitted run has no matching tool-call decision", async () => {
+    const { server, hooks } = setup({ methodsEvaluated: ALL_METHODS });
+    await startRun(hooks);
+
+    expect(await readResult(hooks)).toEqual(WITHHELD);
+    expect(server.steps.map((step) => step.method)).toEqual(["steps/sessionStart", "steps/agentTrigger", "steps/turnStart", "steps/userMessage"]);
+  });
+
+  it.each([
+    ["session id", { ...RESULT_CTX, sessionId: "another-session" }],
+    ["session key", { ...RESULT_CTX, sessionKey: "agent:main:signal:direct:+15550999" }],
+  ])("withholds a result with a mismatched %s", async (_identity, resultContext) => {
+    const { server, hooks } = setup({ methodsEvaluated: ALL_METHODS });
+    await runCall(hooks);
+
+    expect(await readResult(hooks, undefined, resultContext)).toEqual(WITHHELD);
+    expect(server.steps.map((step) => step.method)).not.toContain("steps/toolCallResult");
+  });
+
+  it.each([
+    ["call id", { toolCallId: "different-call", toolName: "account-lookup" }],
+    ["tool name", { toolCallId: "call-1", toolName: "other-tool" }],
+  ])("withholds a result with a mismatched %s", async (_identity, eventIdentity) => {
+    const { server, hooks } = setup({ methodsEvaluated: ALL_METHODS });
+    await runCall(hooks);
+
+    expect(await hooks.toolResult({ ...eventIdentity, args: {}, result: { content: [{ type: "text", text: OUTPUT }] } }, RESULT_CTX)).toEqual(WITHHELD);
+    expect(server.steps.map((step) => step.method)).not.toContain("steps/toolCallResult");
+  });
+
+  it("does not consume the call fact for a result with a mismatched session", async () => {
+    const { hooks } = setup({ methodsEvaluated: ALL_METHODS });
+    await runCall(hooks);
+
+    expect(await readResult(hooks, undefined, { ...RESULT_CTX, sessionId: "another-session" })).toEqual(WITHHELD);
+    expect(await readResult(hooks)).toBeUndefined();
+  });
+
+  it("blocks run admission when OpenClaw declines to store the admission context", async () => {
+    const { hooks, server } = setup({
+      runFacts: {
+        ...memoryRunFacts(),
+        set: async () => { throw new Error("store unavailable"); },
+      },
+    });
+
+    expect(await hooks.beforeAgentRun({ prompt: "Hello", senderId: SENDER }, AGENT_CTX)).toMatchObject({ outcome: "block" });
+    expect(await hooks.beforeToolCall({ toolName: "account-lookup", params: {}, toolCallId: "call-1" }, TOOL_CTX)).toMatchObject({ block: true });
+    expect(server.steps.map((step) => step.method)).not.toContain("steps/toolCallRequest");
+  });
+
+  it("withholds a result when its run ends while the Guardian is deciding", async () => {
+    const pending = heldAnswer();
+    const runFacts = memoryRunFacts();
+    const producer = setup({ methodsEvaluated: ALL_METHODS, runFacts });
+    const consumer = setup({
+      methodsEvaluated: ALL_METHODS,
+      runFacts,
+      reply: (step) => step.method === "steps/toolCallResult" ? pending.answer() : { decision: { decision: "allow" } },
+    });
+    await startRun(producer.hooks);
+    await producer.hooks.beforeToolCall({ toolName: "account-lookup", params: {}, toolCallId: "call-1" }, TOOL_CTX);
+    const result = readResult(consumer.hooks);
+    await pending.reached;
+    const ending = producer.hooks.agentEnd({ runId: "run-1" }, AGENT_CTX);
+    pending.release();
+
+    expect(await result).toEqual(WITHHELD);
+    await ending;
+  });
+
+  it("governs independent concurrent call results by their own ids", async () => {
+    const runFacts = memoryRunFacts();
+    const producer = setup({ methodsEvaluated: ALL_METHODS, runFacts });
+    const consumer = setup({ methodsEvaluated: ALL_METHODS, runFacts });
+    await startRun(producer.hooks);
+    await producer.hooks.beforeToolCall({ toolName: "account-lookup", params: { id: 1 }, toolCallId: "call-1" }, TOOL_CTX);
+    await producer.hooks.beforeToolCall({ toolName: "account-lookup", params: { id: 2 }, toolCallId: "call-2" }, TOOL_CTX);
+
+    const [first, second] = await Promise.all([
+      consumer.hooks.toolResult({ toolCallId: "call-1", toolName: "account-lookup", args: {}, result: { content: [{ type: "text", text: "one" }] } }, RESULT_CTX),
+      consumer.hooks.toolResult({ toolCallId: "call-2", toolName: "account-lookup", args: {}, result: { content: [{ type: "text", text: "two" }] } }, RESULT_CTX),
+    ]);
+    expect([first, second]).toEqual([undefined, undefined]);
+    expect(consumer.server.steps.filter((step) => step.method === "steps/toolCallResult")).toHaveLength(2);
+  });
+
   it("withholds a result outside an admitted run without asking", async () => {
     const { server, hooks } = setup({ methodsEvaluated: ALL_METHODS });
     expect(await readResult(hooks)).toEqual({ result: { content: [{ type: "text", text: WITHHELD_OUTPUT }] } });
@@ -1767,8 +2374,9 @@ describe("no step the plugin could not have decided passes", () => {
     hooks.toolResult({ toolCallId: "call-1", toolName: "account-lookup", args: {}, result: { content: [{ type: "text", text: "secret" }] } }, RESULT_CTX);
 
   /** Hooks whose exchange throws for `failing` and lets every other step through unsent. */
-  function throwingFor(failing: string): { hooks: Hooks; errors: string[] } {
+  function throwingFor(failing: string, blockedReplyText: string | null = BLOCKED): { hooks: Hooks; errors: string[]; audit: AuditEvent[] } {
     const errors: string[] = [];
+    const audit: AuditEvent[] = [];
     const exchange: AcsExchange = {
       async decide(step) {
         if (step.method === failing) {
@@ -1780,13 +2388,14 @@ describe("no step the plugin could not have decided passes", () => {
       deadlineFromNow: () => performance.now() + 2000,
     };
     const hooks = createHooks({
-      config: { approvers: new Set(), blockedReplyText: BLOCKED, maxUndecidedMessages: 20 },
+      config: { approvers: new Set(), ...(blockedReplyText === null ? {} : { blockedReplyText }), maxUndecidedMessages: 20 },
       exchange,
-      audit: { path: "memory", write: () => true },
+      audit: { path: "memory", write: (event) => (audit.push(event), true) },
       requirementFailure: () => undefined,
       logger: { error: (message) => errors.push(message) },
+      runFacts: memoryRunFacts(),
     });
-    return { hooks, errors };
+    return { hooks, errors, audit };
   }
 
   it.each<[string, (hooks: Hooks) => Promise<unknown>, unknown]>([
@@ -1798,6 +2407,15 @@ describe("no step the plugin could not have decided passes", () => {
   ])("blocks when the exchange throws at %s", async (method, act, expected) => {
     const { hooks } = throwingFor(method);
     expect(await act(hooks)).toEqual(expected);
+  });
+
+  it("cancels a reply when the exchange throws and no blockedReplyText is configured, and audits it", async () => {
+    const { hooks, audit } = throwingFor("steps/agentResponse", null);
+    await startRun(hooks);
+    expect(await hooks.messageSending({ to: SENDER, content: "secret" }, MESSAGE_CTX)).toEqual({ cancel: true });
+    expect(audit).toEqual([
+      expect.objectContaining({ method: "steps/agentResponse", outcome: "refused", refused: { reason_code: "plugin_failed", reason: "the ACS plugin failed: exchange broke" } }),
+    ]);
   });
 
   it("drops a message joining a running turn when the exchange throws", async () => {
@@ -1819,6 +2437,7 @@ describe("no step the plugin could not have decided passes", () => {
       audit: { path: "memory", write: () => true },
       requirementFailure: () => undefined,
       logger: { error: () => {} },
+      runFacts: memoryRunFacts(),
     });
     await startRun(hooks);
     expect(await hooks.beforeDispatch({ content: "more", sessionKey: SESSION_KEY, senderId: SENDER }, { channelId: "signal" })).toEqual({ handled: true, text: BLOCKED });
@@ -2082,7 +2701,7 @@ describe("the gates read a tool's parameters as OpenClaw does", () => {
   it("grants a message send on the account account_id names", async () => {
     const { hooks } = setup();
     await startRun(hooks);
-    await hooks.beforeToolCall({ toolName: "message", params: { action: "send", target: OTHER_PHONE, message: "Hi", account_id: "second" }, toolCallId: "call-m" }, TOOL_CTX);
+    await hooks.beforeToolCall({ toolName: "message", params: { action: "send", replyContext: REPLY_CONTEXT, target: OTHER_PHONE, message: "Hi", account_id: "second" }, toolCallId: "call-m" }, TOOL_CTX);
     expect(await hooks.messageSending({ to: OTHER_PHONE, content: "Hi" }, { channelId: "signal", accountId: "default" })).toEqual({ cancel: true });
     expect(await hooks.messageSending({ to: OTHER_PHONE, content: "Hi" }, { channelId: "signal", accountId: "second" })).toEqual({ content: "Hi" });
   });

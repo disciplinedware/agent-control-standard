@@ -94,7 +94,7 @@
       "maxUndecidedMessages": {
         "type": "integer",
         "minimum": 1,
-        "description": "The most messages of one session the plugin keeps for a run not yet admitted. A message beyond it is dropped with blockedReplyText."
+        "description": "The most messages of one session the plugin keeps for a run not yet admitted. A message beyond it is dropped."
       },
       "approvers": {
         "type": "array",
@@ -105,7 +105,8 @@
       },
       "blockedReplyText": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "description": "What the person receives in place of a reply, a message or a run that was blocked. Unset by default: a blocked delivery is cancelled and nothing is sent in its place."
       },
       "auditLog": {
         "type": "string",

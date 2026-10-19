@@ -5,15 +5,19 @@
  * `mapping.md` maps each hook to the ACS steps it sends and what each answer
  * does.
  *
- * A message outside a session a run of its recipient was admitted to is not
- * sent at all: nobody in that conversation asked for it, so neither it nor the
- * fixed text goes out. The one exception is a send of OpenClaw's own `message`
- * tool to another recipient: the Guardian decided that recipient and that text
- * at `before_tool_call`, so the send goes out under the run that made the
- * call, only to a recipient the call named, only with the text the call
- * carried, and only until the call returns. It is not a response to the
- * session's user, so it is not sent to the Guardian again as
- * `steps/agentResponse`.
+ * A delivery is classified by the step it belongs to. A send of an executed
+ * call of OpenClaw's own `message` tool is that call's action: the Guardian,
+ * or the person who approved, decided its recipient and its text at
+ * `steps/toolCallRequest`, so it goes out under the run that made the call,
+ * only to a recipient the call named (the run's own sender included), only
+ * with the text the call carried, and only until the call returns, and is not
+ * sent to the Guardian again. Every other delivery to the session's sender is
+ * `steps/agentResponse`, and its decision is applied as §6.4 says: `allow`
+ * sends it, `modify` sends the Guardian's text, any other answer blocks it.
+ * A blocked delivery is cancelled, or replaced by the fixed text when the
+ * deployment configures one. A message outside a session a run of its
+ * recipient was admitted to is not sent at all: nobody in that conversation
+ * asked for it, so neither it nor the fixed text goes out.
  *
  * A run with no channel sender is governed as the person it acts for, when
  * OpenClaw names that person: a scheduled run (`trigger: "cron"`) in a session
@@ -28,9 +32,8 @@
  * (OpenClaw's `steer`, its default queue mode) without `before_agent_run`, so
  * it is decided at `before_dispatch`, which OpenClaw awaits before it steers,
  * queues or starts anything, one message of a session at a time: as
- * `steps/userMessage` of the active run, or dropped with the fixed text. A
- * message of a session with no active run starts a run, decided at
- * `before_agent_run`.
+ * `steps/userMessage` of the active run, or dropped. A message of a session
+ * with no active run starts a run, decided at `before_agent_run`.
  *
  * Every step carries the OpenClaw agent that runs it as `metadata.agent_name`.
  *
@@ -47,11 +50,12 @@
  * reads and writes.
  */
 import { toSessionUuid, WITHHELD_OUTPUT, type AcsDecision, type AuditSink } from "./host-adapter.ts";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AcsExchange, Step, StepOutcome, UserContext } from "./acs-exchange.ts";
 import { METHODS } from "./acs-exchange.ts";
 import type { PluginConfig } from "./config.ts";
 import { readStringParam } from "openclaw/plugin-sdk/param-readers";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { notOneSenderSessionBecause } from "./openclaw-settings.ts";
 import type { Facts } from "./requirements.ts";
 
@@ -72,6 +76,7 @@ export type AgentContext = {
   /** The model the run uses. */
   modelProviderId?: string;
   modelId?: string;
+  channelContext?: { chat?: { receivedText?: string }; sender?: { id?: string; name?: string } };
 };
 /** OpenClaw's `inputProvenance`: an inter-session run names the session that sent it. */
 export type InputProvenance = { kind?: string; sourceSessionKey?: string };
@@ -85,9 +90,16 @@ export type ToolContext = { runId?: string; sessionKey?: string; sessionId?: str
 export type BeforeToolCallEvent = { toolName: string; params: Record<string, unknown>; runId?: string; toolCallId?: string };
 export type AfterToolCallEvent = { toolName: string; runId?: string; toolCallId?: string };
 export type ApprovalResolution = "allow-once" | "allow-always" | "deny" | "timeout" | "cancelled";
+export type ApprovalScope = {
+  kind: "message-send";
+  target: string;
+  recipientCount: number;
+  recipients?: string[];
+};
 export type RequireApproval = {
   title: string;
   description: string;
+  scope?: ApprovalScope;
   severity?: "info" | "warning" | "critical";
   timeoutMs?: number;
   timeoutReason?: string;
@@ -99,7 +111,7 @@ export type BeforeToolCallResult =
   | undefined;
 
 export type MessageContext = { channelId: string; sessionKey?: string; accountId?: string };
-export type MessageReceivedEvent = { from: string; content: string; senderId?: string };
+export type MessageReceivedEvent = { from: string; content: string; senderId?: string; metadata?: Record<string, unknown> };
 export type MessageSendingEvent = { to: string; content: string };
 export type MessageSendingResult = { content: string } | { cancel: true };
 
@@ -109,6 +121,16 @@ export type ToolResult = { content: ToolResultBlock[]; details?: unknown };
 export type ToolResultEvent = { toolCallId: string; toolName: string; args: Record<string, unknown>; isError?: boolean; result: ToolResult };
 export type ToolResultContext = { runtime: string; sessionId?: string; sessionKey?: string; runId?: string };
 export type ToolResultAnswer = { result: ToolResult } | undefined;
+
+/** OpenClaw-owned run facts shared by separate registrations of this plugin. */
+export type RunFactsStore = {
+  set(runId: string, namespace: string, value: Record<string, unknown>): Promise<void>;
+  setIfAbsent(runId: string, namespace: string, value: Record<string, unknown>): Promise<boolean>;
+  get(runId: string, namespace: string): Promise<unknown>;
+  consume(runId: string, namespace: string): Promise<unknown>;
+  clear(runId: string, namespace?: string): Promise<void>;
+  pruneOtherProcesses(): Promise<void>;
+};
 
 export type AgentEndEvent = { runId?: string; success?: boolean };
 export type SessionEndEvent = { sessionKey?: string; sessionId?: string; reason?: string };
@@ -179,6 +201,7 @@ type AdmittedRun = {
   agentName?: string;
   /** The channel account the run came in on, when OpenClaw names one. */
   accountId?: string;
+  receivedText?: string;
   toolCallCount: number;
 };
 
@@ -195,6 +218,10 @@ const MESSAGE_TOOL = "message";
 const MESSAGE_TARGET_PARAMS = ["target", "to", "channelId"] as const;
 const MESSAGE_SEND_ACTIONS: ReadonlySet<unknown> = new Set(["send", "thread-reply", "sendWithEffect", "sendAttachment", "upload-file", "broadcast"]);
 
+function isMessageApprovalRequest(toolName: string, params: Record<string, unknown>): boolean {
+  return toolName === MESSAGE_TOOL && params.action === "send" && params.requestApproval === true;
+}
+
 /** OpenClaw's built-in tool that spawns a sub-agent: `task` is what the parent asks of it, `agentId` the agent that runs it. */
 const SPAWN_TOOL = "sessions_spawn";
 /** OpenClaw's built-in tool that sends a message into another session, `sessionKey` naming it. */
@@ -207,6 +234,25 @@ function writeRefused(audit: AuditSink, sessionId: string | undefined, method: s
 
 /** The audit `reason_code` of a step from a run that never passed `before_agent_run`. */
 const RUN_NOT_ADMITTED = "run_not_admitted";
+
+/** The audit `reason_code` of a delivery cancelled because the plugin failed while governing it. */
+const PLUGIN_FAILED = "plugin_failed";
+
+// §6.4: DENY blocks the action. A text in its place would be a message no one
+// decided, so the plugin sends one only when the deployment configures
+// `blockedReplyText`.
+
+function blockedRun(reason: string, blockedReplyText: string | undefined): BeforeAgentRunResult {
+  return { outcome: "block", reason, ...(blockedReplyText === undefined ? {} : { message: blockedReplyText }) };
+}
+
+function droppedMessage(blockedReplyText: string | undefined): BeforeDispatchResult {
+  return blockedReplyText === undefined ? { handled: true } : { handled: true, text: blockedReplyText };
+}
+
+function blockedDelivery(blockedReplyText: string | undefined): MessageSendingResult {
+  return blockedReplyText === undefined ? { cancel: true } : { content: blockedReplyText };
+}
 
 /** The audit `reason_code` of a failed requirement, from its `"<id>: <why>"`. */
 export function requirementCode(failure: string): string {
@@ -221,6 +267,57 @@ const WITHHELD_RESULT: ToolResultAnswer = { result: { content: [{ type: "text", 
  * result refers to, and whether it may run.
  */
 type DecidedCall = { run: AdmittedRun; requestId: string | null; ran: boolean };
+
+function callNamespace(toolCallId: string): string {
+  return `tool-call-${createHash("sha256").update(toolCallId).digest("hex")}`;
+}
+
+function toolCallFact(params: {
+  runId: string;
+  sessionKey: string;
+  sessionId: string;
+  toolCallId: string;
+  toolName: string;
+  requestId: string | null;
+  ran: boolean;
+}): Record<string, unknown> {
+  return { kind: "tool-call", ...params, processing: false };
+}
+
+function isAdmittedRunContext(value: unknown, runId: string, ctx: ToolResultContext): value is Record<string, unknown> & {
+  runId: string;
+  sessionKey: string;
+  sessionId: string;
+  userContext: UserContext;
+} {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return candidate.runId === runId &&
+    typeof candidate.sessionKey === "string" && candidate.sessionKey === ctx.sessionKey &&
+    typeof candidate.sessionId === "string" && candidate.sessionId === ctx.sessionId &&
+    candidate.terminal !== true &&
+    candidate.userContext !== null && typeof candidate.userContext === "object" &&
+    typeof (candidate.userContext as Record<string, unknown>).user_id === "string" &&
+    typeof (candidate.userContext as Record<string, unknown>).authentication_method === "string";
+}
+
+function isToolCallContext(value: unknown, event: ToolResultEvent, runId: string, ctx: ToolResultContext, processing?: boolean): value is Record<string, unknown> & {
+  requestId: string | null;
+  ran: boolean;
+  processing: boolean;
+} {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return candidate.kind === "tool-call" && candidate.runId === runId &&
+    candidate.sessionKey === ctx.sessionKey && candidate.sessionId === ctx.sessionId &&
+    candidate.toolCallId === event.toolCallId && candidate.toolName === event.toolName &&
+    (candidate.requestId === null || typeof candidate.requestId === "string") &&
+    typeof candidate.ran === "boolean" && candidate.processing === (processing ?? false);
+}
 
 /** `steps/toolCallResult` outputs: one per content block, a text block as its text. */
 function outputsOf(content: readonly ToolResultBlock[]): Array<{ value: unknown }> {
@@ -248,6 +345,22 @@ function contentOf(outputs: unknown): ToolResultBlock[] | undefined {
   return content;
 }
 
+/** The text a modified reply's `content` describes, one line per item, or `undefined` when an item is not text. */
+function textOf(content: unknown): string | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const lines: string[] = [];
+  for (const item of content) {
+    const text = item as { type?: unknown; value?: unknown } | null;
+    if (text?.type !== "text" || typeof text.value !== "string") {
+      return undefined;
+    }
+    lines.push(text.value);
+  }
+  return lines.join("\n");
+}
+
 function deleteWhere<K, V>(map: Map<K, V>, isGone: (value: V) => boolean): void {
   for (const [key, value] of map) {
     if (isGone(value)) {
@@ -257,9 +370,9 @@ function deleteWhere<K, V>(map: Map<K, V>, isGone: (value: V) => boolean): void 
 }
 
 /**
- * A `message` call the Guardian allowed, or a person approved, to recipients
- * other than its run's sender: delivery to one of them goes out under that
- * run until the call returns, the run ends or its session ends.
+ * A `message` call the Guardian allowed, or a person approved: delivery to a
+ * recipient it names, the run's own sender included, goes out as that call's
+ * action until the call returns, the run ends or its session ends.
  */
 type SendGrant = {
   /** OpenClaw's id of the call, the grant's key. */
@@ -270,9 +383,20 @@ type SendGrant = {
   /** The account the call named, else its run's; `undefined` when neither is known. */
   accountId?: string;
   recipients: ReadonlySet<string>;
-  /** The text the call sends; a delivery under the grant carries exactly this text. */
-  text?: string;
+  /** The words of the text the call sends; a delivery under the grant carries exactly these words. */
+  words: string;
 };
+
+/**
+ * A text's words in order, one space between each. OpenClaw trims and re-spaces
+ * a `message` call's text before `message_sending` (`parseInlineDirectives`,
+ * the channel's `sanitizeText`), so the words are what a delivery shares with
+ * the call. Any other change, such as a word added, removed, split or joined,
+ * makes another text.
+ */
+function wordsOf(text: string): string {
+  return text.split(/\s+/u).filter((word) => word.length > 0).join(" ");
+}
 
 function trimmedString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
@@ -280,19 +404,21 @@ function trimmedString(value: unknown): string | undefined {
 
 /**
  * The grant a `message` call's parameters make for its run, or `undefined`
- * when they name no recipient but the run's own sender. A recipient is the
- * string the Guardian saw, trimmed: OpenClaw gives a plugin no channel's
- * target normalizer, so a recipient written in another form than the one
- * OpenClaw delivers to matches nothing, and its send is cancelled.
+ * when its action delivers nothing or it names no recipient. A call that
+ * names none on the run's own channel goes to the current conversation
+ * (OpenClaw's `message-action-normalization`), whose person is the run's
+ * sender. A recipient is the string the Guardian saw, trimmed: OpenClaw gives
+ * a plugin no channel's target normalizer, so a recipient written in another
+ * form than the one OpenClaw delivers to matches nothing, and its delivery
+ * takes the session's path.
  */
 function sendGrantOf(callId: string, runId: string, run: AdmittedRun, params: Record<string, unknown>): SendGrant | undefined {
   if (!MESSAGE_SEND_ACTIONS.has(params.action)) {
     return undefined;
   }
   const channel = trimmedString(params.channel)?.toLowerCase() ?? run.userContext.authentication_method;
-  const recipients = new Set(
-    messageRecipients(params).filter((recipient) => recipient !== run.userContext.user_id || channel !== run.userContext.authentication_method),
-  );
+  const named = messageRecipients(params);
+  const recipients = new Set(named.length > 0 ? named : channel === run.userContext.authentication_method ? [run.userContext.user_id] : []);
   if (recipients.size === 0) {
     return undefined;
   }
@@ -303,7 +429,7 @@ function sendGrantOf(callId: string, runId: string, run: AdmittedRun, params: Re
     channel,
     accountId: readStringParam(params, "accountId") ?? run.accountId,
     recipients,
-    text: typeof params.message === "string" ? params.message : undefined,
+    words: typeof params.message === "string" ? wordsOf(params.message) : "",
   };
 }
 
@@ -327,7 +453,7 @@ function samePrincipal(a: UserContext, b: UserContext): boolean {
 }
 
 function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+  return text.length <= max ? text : `${truncateUtf16Safe(text, max - 1)}…`;
 }
 
 function reasoningOf(decision: AcsDecision): string {
@@ -390,86 +516,98 @@ function messageRecipients(params: Record<string, unknown>): string[] {
  * (`resolveActionDeliveryTargetAlias`, `src/infra/outbound/message-action-spec.ts`),
  * which the plugin cannot read; the line says so rather than name the sender.
  */
-function messageCallLines(params: Record<string, unknown>, sender: string): string[] {
+function messageCallLines(params: Record<string, unknown>, sender: string, displayName: (person: string) => string | undefined): string[] {
   const recipients = messageRecipients(params);
-  const others = Object.keys(params).some((name) => !MESSAGE_CALL_SHOWN_PARAMS.has(name) && name !== "action");
+  const hidden = new Set(["replyContext", ...(params.action === "send" ? ["requestApproval", ...(typeof params.final === "boolean" ? ["final"] : [])] : [])]);
+  const others = Object.keys(params).some((name) => !MESSAGE_CALL_SHOWN_PARAMS.has(name) && !hidden.has(name) && name !== "action");
   const lines = [
     recipients.length > 0
-      ? `To: ${recipients.join(", ")}`
-      : `To: ${sender}${others ? ", unless a parameter under Other names another recipient" : ""}`,
+      ? `👤 ${recipients.map((person) => displayName(person) ? `${displayName(person)} · ${person}` : person).join("; ")}`
+      : `👤 ${displayName(sender) ? `${displayName(sender)} · ` : ""}${sender}${others ? ", unless a parameter under Other names another recipient" : ""}`,
   ];
   if (typeof params.message === "string") {
-    // A text of several lines is shown under a bar, so none of its lines can
-    // pass for a line of the prompt.
-    lines.push(...(params.message.includes("\n") ? ["Text:", ...params.message.split("\n").map((line) => `  | ${line}`)] : [`Text: ${params.message}`]));
+    lines.push(...quotedTextLines("💬", params.message));
   }
   const shown = new Set<string>([...MESSAGE_CALL_SHOWN_PARAMS, ...(params.action === "send" ? ["action"] : [])]);
-  const rest = Object.fromEntries(Object.entries(params).filter(([name]) => !shown.has(name)));
+  const rest = Object.fromEntries(Object.entries(params).filter(([name]) => !shown.has(name) && !hidden.has(name)));
   if (Object.keys(rest).length > 0) {
     lines.push(`Other: ${JSON.stringify(rest)}`);
   }
   return lines;
 }
 
-/**
- * What the approver reads: the Guardian's question, then the call exactly as
- * it will run, so the person approves the parameters, not a summary of them.
- * A `message` call is shown in plain words, followed by what its recipients
- * wrote since the agent last wrote to them, each message on one quoted line
- * so a recipient's words cannot pass for a line of the call: the oldest is
- * cut first, and the call never. `undefined` when the call does not fit
- * OpenClaw's bound whole: a cut call would be approved as if it were whole.
- */
-function approvalText(
+function quotedTextLines(label: string, text: string): string[] {
+  return [label, ...text.split("\n").map((line) => `  | ${line}`)];
+}
+
+/** Never truncate an approved call: a partial preview would authorize unseen text. */
+function approvalDescription(
   details: AskDetails,
   decision: AcsDecision,
   approverId: string,
   toolName: string,
   params: Record<string, unknown>,
   sender: string,
-  written: (person: string) => readonly string[],
+  receivedText: string | undefined,
+  displayName: (person: string) => string | undefined,
 ): string | undefined {
   const head = [typeof details.question === "string" ? details.question : reasoningOf(decision)];
   if (typeof details.context === "string") {
     head.push(details.context);
   }
+  if (toolName === MESSAGE_TOOL) {
+    head.push("", ...quotedTextLines("Context:", (params.replyContext as string).trim()));
+  }
   if (Array.isArray(details.options) && details.options.length > 0) {
     head.push(`Options: ${details.options.map(String).join("; ")}`);
   }
-  const call = toolName === MESSAGE_TOOL ? messageCallLines(params, sender) : [`Call: ${toolName} ${JSON.stringify(params)}`];
-  call.push(`Approver: ${approverId}`);
-  const whole = (wrote: string[]) => [...head, ...call, ...wrote].join("\n");
-  if (whole([]).length > APPROVAL_DESCRIPTION_MAX) {
-    return undefined;
-  }
-  if (toolName !== MESSAGE_TOOL) {
-    return whole([]);
-  }
-  const recipients = messageRecipients(params);
-  let wrote: string[] = [];
-  for (const person of recipients.length > 0 ? recipients : [sender]) {
-    const messages = written(person);
-    if (messages.length === 0) {
-      continue;
+  const call = toolName === MESSAGE_TOOL ? messageCallLines(params, sender, displayName) : [`Call: ${toolName} ${JSON.stringify(params)}`];
+  const incomingLabel = messageRecipients(params).some((recipient) => recipient !== sender)
+    ? `📥 ${displayName(sender) ? `${displayName(sender)} · ` : ""}${sender}`
+    : "📥";
+  const render = (incomingText?: string) => {
+    if (toolName !== MESSAGE_TOOL) {
+      return [...head, ...call, `Approver: ${approverId}`].join("\n");
     }
-    // Newest first, so the oldest is what does not fit.
-    const kept: string[] = [];
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const quoted = `  > ${messages[i]!.replace(/\s+/g, " ")}`;
-      const room = APPROVAL_DESCRIPTION_MAX - whole([...wrote, `Before this, ${person} wrote:`, ...kept]).length - 1;
-      if (room <= 4) {
-        break;
-      }
-      kept.unshift(quoted.length <= room ? quoted : truncate(quoted, room));
-      if (quoted.length > room) {
-        break;
-      }
-    }
-    if (kept.length > 0) {
-      wrote = [...wrote, `Before this, ${person} wrote:`, ...kept];
+    return [
+      call[0],
+      ...head,
+      ...(incomingText === undefined ? [] : ["", ...quotedTextLines(incomingLabel, incomingText)]),
+      "",
+      ...call.slice(1),
+    ].join("\n");
+  };
+  const description = render();
+  if (toolName !== MESSAGE_TOOL || receivedText === undefined) {
+    return description.length <= APPROVAL_DESCRIPTION_MAX ? description : undefined;
+  }
+
+  const completeDescription = render(receivedText);
+  if (completeDescription.length <= APPROVAL_DESCRIPTION_MAX) {
+    return completeDescription;
+  }
+
+  const firstReadableText = receivedText.trimStart();
+  const firstCodePoint = Array.from(firstReadableText)[0];
+  if (!firstCodePoint) {
+    return description.length <= APPROVAL_DESCRIPTION_MAX ? description : undefined;
+  }
+  const minimumPrefixLength = receivedText.length - firstReadableText.length + firstCodePoint.length;
+  let low = minimumPrefixLength;
+  let high = receivedText.length - 1;
+  let shortenedDescription = description.length <= APPROVAL_DESCRIPTION_MAX ? description : undefined;
+  while (low <= high) {
+    const prefixLength = Math.floor((low + high) / 2);
+    const excerpt = `${truncateUtf16Safe(receivedText, prefixLength)}…`;
+    const candidate = render(excerpt);
+    if (candidate.length <= APPROVAL_DESCRIPTION_MAX) {
+      shortenedDescription = candidate;
+      low = prefixLength + 1;
+    } else {
+      high = prefixLength - 1;
     }
   }
-  return whole(wrote);
+  return shortenedDescription;
 }
 
 export type CreateHooksOptions = {
@@ -479,8 +617,10 @@ export type CreateHooksOptions = {
   /** The first requirement (`requirements.ts`) checked at `point` that the config OpenClaw runs with now fails for `facts`, or `undefined`. */
   requirementFailure(point: "run" | "dispatch", facts: Facts): string | undefined;
   logger: { error(message: string): void };
-  /** Where admissions outlive the process; in memory only when absent. */
+  /** In-memory admission store for direct hook tests; production requires the OpenClaw store. */
   admissions?: AdmissionStore;
+  /** OpenClaw's plugin-scoped state store is the only bridge between registrations. */
+  runFacts: RunFactsStore;
 };
 
 /** Who a run acts for, and how it was triggered. */
@@ -500,7 +640,24 @@ export function createHooks({
   requirementFailure,
   logger,
   admissions: store = memoryOnlyAdmissions,
+  runFacts,
 }: CreateHooksOptions): Hooks {
+  async function revokeRunFacts(runId: string): Promise<void> {
+    try {
+      const admission = await runFacts.get(runId, "admission");
+      if (admission !== undefined && typeof admission === "object" && admission !== null) {
+        await runFacts.set(runId, "admission", { ...(admission as Record<string, unknown>), terminal: true });
+      }
+    } catch (error) {
+      logger.error(`ACS plugin could not mark run facts terminal: ${(error as Error).message}`);
+    }
+    try {
+      await runFacts.clear(runId);
+    } catch (error) {
+      logger.error(`ACS plugin could not clear run facts: ${(error as Error).message}`);
+    }
+  }
+
   /**
    * The sender of every session that has had an admitted run, until OpenClaw
    * ends the session, so the map is as large as OpenClaw's own set of live
@@ -595,11 +752,9 @@ export function createHooks({
    */
   const startedSessions = new Map<string, true | string>();
   /**
-   * What each person wrote since the agent's last message to them, oldest
-   * first, by channel and person: an approval prompt shows it. Only as much as
-   * a prompt can hold is kept.
+   * Channel-observed display names are presentation only, scoped to one account and person.
    */
-  const unanswered = new Map<string, string[]>();
+  const senderNames = new Map<string, string>();
   /** One person on one channel account: an approver of one account never sees what was written to another. */
   const personKey = (channel: string, accountId: string | undefined, person: string) => `${channel}\n${accountId ?? ""}\n${person}`;
   /** Grants of `message` calls that have not returned, by OpenClaw's tool call id. */
@@ -609,20 +764,21 @@ export function createHooks({
 
   /**
    * The live grant a send to `to` goes out under, or `undefined`. A delivery
-   * names no run of its own, so it is a grant's only with the grant's exact
-   * text: the Guardian, or the person who approved, decided that text, and
-   * any other delivery to the recipient, such as their own session's reply,
-   * takes the session's path. Two runs' grants to one recipient with one text
-   * leave no single run, and the delivery is not sent.
+   * names no run or tool call of its own, so it is a grant's only with the
+   * grant's words: the Guardian, or the person who approved, decided those
+   * words, and any other delivery to the recipient, such as their own
+   * session's reply, takes the session's path. Two runs' grants to one
+   * recipient with one text leave no single run, and the delivery is not sent.
    */
   function grantFor(to: string, ctx: MessageContext, content: string): SendGrant | undefined {
+    const words = wordsOf(content);
     const matching = [...sendGrants.values()].filter(
       (grant) =>
         runs.get(grant.runId) === grant.run &&
         grant.channel === ctx.channelId &&
         (grant.accountId === undefined || grant.accountId === ctx.accountId) &&
         grant.recipients.has(to) &&
-        (grant.text ?? "") === content,
+        grant.words === words,
     );
     return matching.length > 0 && matching.every((grant) => grant.run === matching[0]!.run) ? matching[0] : undefined;
   }
@@ -665,7 +821,7 @@ export function createHooks({
     decision: AcsDecision,
     run: AdmittedRun,
     requestId: string | null,
-    onApproved: () => void,
+    onApproved: (params: Record<string, unknown>) => Promise<void> | void,
   ): BeforeToolCallResult {
     const { sessionId } = run;
     const channel = run.userContext.authentication_method;
@@ -681,23 +837,51 @@ export function createHooks({
         blockReason: `${reasoningOf(decision)} (approval by ${JSON.stringify(approverId)} cannot be requested from this host)`,
       };
     }
-    const description = approvalText(details, decision, approverId, toolName, params, run.userContext.user_id, (person) =>
-      unanswered.get(personKey(channel, accountId, person)) ?? [],
+    if (toolName === MESSAGE_TOOL && !trimmedString(params.replyContext)) {
+      auditSubstitution(sessionId, METHODS.toolCallRequest, requestId, "ask", "reply_context_missing");
+      return {
+        block: true,
+        blockReason: "Human approval requires replyContext: a nonempty string summarizing the relevant request and unresolved questions. Add replyContext and repeat the same proposed message operation. Nothing was sent and no approval was created.",
+      };
+    }
+    const executionParams = isMessageApprovalRequest(toolName, params)
+      ? { ...params, requestApproval: false }
+      : params;
+    const description = approvalDescription(
+      details,
+      decision,
+      approverId,
+      toolName,
+      executionParams,
+      run.userContext.user_id,
+      run.receivedText,
+      (person) => senderNames.get(personKey(channel, accountId, person)),
     );
     if (description === undefined) {
       auditSubstitution(sessionId, METHODS.toolCallRequest, requestId, "ask", "approval_text_too_long");
       return {
         block: true,
-        blockReason: `${reasoningOf(decision)} (the approval cannot show this call whole within ${APPROVAL_DESCRIPTION_MAX} characters; make it shorter)`,
+        blockReason: `${reasoningOf(decision)} (the approval cannot show this call whole within ${APPROVAL_DESCRIPTION_MAX} characters; ${toolName === MESSAGE_TOOL ? "shorten replyContext or the proposed message and repeat the call" : "make the proposed call shorter"}; nothing was sent and no approval was created)`,
       };
     }
     return {
-      // The parameters the Guardian saw: OpenClaw freezes the parameters an
-      // approval covers when the approval is requested.
-      params,
+      // Clearing the request is part of the frozen call, which OpenClaw runs only after approval.
+      params: executionParams,
       requireApproval: {
         title: truncate(`Approve ${toolName}?`, APPROVAL_TITLE_MAX),
         description,
+        ...(toolName === MESSAGE_TOOL ? {
+          scope: (() => {
+            const recipients = messageRecipients(executionParams);
+            const effectiveRecipients = recipients.length > 0 ? recipients : [run.userContext.user_id];
+            return {
+              kind: "message-send" as const,
+              target: channel,
+              recipientCount: effectiveRecipients.length,
+              recipients: effectiveRecipients.slice(0, 5),
+            };
+          })(),
+        } : {}),
         severity: "warning",
         timeoutMs: details.timeout_seconds * 1000,
         timeoutReason: `No approval within ${details.timeout_seconds} seconds; the call was not run.`,
@@ -705,7 +889,9 @@ export function createHooks({
         // OpenClaw calls this before it runs an approved call.
         onResolution(resolution: ApprovalResolution): void {
           if (resolution === "allow-once" || resolution === "allow-always") {
-            onApproved();
+            void Promise.resolve(onApproved(executionParams)).catch((error: unknown) => {
+              logger.error(`ACS plugin could not record approved tool-call authorization: ${(error as Error).message}`);
+            });
           }
           audit.write({
             session_id: sessionId,
@@ -839,6 +1025,8 @@ export function createHooks({
   /** `undefined` when the run may start; otherwise why it may not. */
   async function governRun(event: BeforeAgentRunEvent, ctx: AgentContext): Promise<string | undefined> {
     const deadlineAt = exchange.deadlineFromNow();
+    const receivedText = ctx.channelContext?.chat?.receivedText;
+    const admittedReceivedText = typeof receivedText === "string" ? receivedText : undefined;
     await until(restored(), deadlineAt);
     const { sessionKey, sessionId, runId } = ctx;
     if (sessionKey === undefined || sessionId === undefined || runId === undefined) {
@@ -946,7 +1134,15 @@ export function createHooks({
       leaveUndecided();
       return startedAfter;
     }
-    const run: AdmittedRun = { sessionKey, sessionId, userContext, agentName, accountId: ctx.accountId, toolCallCount: 0 };
+    const run: AdmittedRun = {
+      sessionKey,
+      sessionId,
+      userContext,
+      agentName,
+      accountId: ctx.accountId,
+      ...(admittedReceivedText !== undefined ? { receivedText: admittedReceivedText } : {}),
+      toolCallCount: 0,
+    };
     runs.set(runId, run);
     liveRunOfSession.set(sessionKey, runId);
     const held = admittedSessions.get(sessionKey);
@@ -958,6 +1154,26 @@ export function createHooks({
       if (runs.get(runId) !== run) {
         return "the run or its session ended while it was admitted";
       }
+    }
+    try {
+      await runFacts.set(runId, "admission", {
+      runId,
+      sessionKey,
+      sessionId,
+      userContext,
+      agentName: agentName ?? null,
+      accountId: ctx.accountId ?? null,
+      });
+    } catch {
+      runs.delete(runId);
+      if (liveRunOfSession.get(sessionKey) === runId) {
+        liveRunOfSession.delete(sessionKey);
+      }
+      return "OpenClaw did not retain this run's admission context";
+    }
+    const senderName = trimmedString(ctx.channelContext?.sender?.name);
+    if (ctx.channelContext?.sender?.id === userContext.user_id && senderName !== undefined) {
+      senderNames.set(personKey(channel, ctx.accountId, userContext.user_id), truncate(senderName.replace(/\s+/g, " "), APPROVAL_DESCRIPTION_MAX));
     }
     return undefined;
   }
@@ -1093,21 +1309,58 @@ export function createHooks({
     const decided: DecidedCall = { run, requestId: outcome.requestId, ran: false };
     if (callId !== undefined) {
       decidedCalls.set(callId, decided);
+      if (!(await runFacts.setIfAbsent(runId, callNamespace(callId), toolCallFact({
+        runId,
+        sessionKey,
+        sessionId,
+        toolCallId: callId,
+        toolName: event.toolName,
+        requestId: outcome.requestId,
+        ran: false,
+      })))) {
+        decidedCalls.delete(callId);
+        return { block: true, blockReason: "OpenClaw did not retain this call's authorization context." };
+      }
     }
     /** Marks the call as run with `params`, and lets a `message` call deliver to the recipients they name. */
-    const runWith = (params: Record<string, unknown>): void => {
-      decided.ran = true;
-      if (callId === undefined || event.toolName !== MESSAGE_TOOL || runs.get(runId) !== run) {
+    const runWith = async (params: Record<string, unknown>): Promise<void> => {
+      if (callId === undefined || runs.get(runId) !== run) {
         return;
       }
-      const grant = sendGrantOf(callId, runId, run, params);
-      if (grant !== undefined) {
-        sendGrants.set(callId, grant);
+      decided.ran = true;
+      if (event.toolName === MESSAGE_TOOL) {
+        const grant = sendGrantOf(callId, runId, run, params);
+        if (grant !== undefined) {
+          sendGrants.set(callId, grant);
+        }
+      }
+      try {
+        await runFacts.set(runId, callNamespace(callId), toolCallFact({
+          runId, sessionKey, sessionId, toolCallId: callId,
+          toolName: event.toolName, requestId: outcome.requestId, ran: true,
+        }));
+      } catch (error) {
+        decided.ran = false;
+        sendGrants.delete(callId);
+        throw error;
+      }
+      if (runs.get(runId) !== run) {
+        decided.ran = false;
+        sendGrants.delete(callId);
+        await runFacts.clear(runId, callNamespace(callId));
       }
     };
     const applied = decision.decision === "modify" ? (decision.applied_input as Record<string, unknown> | undefined) : undefined;
     if (decision.decision === "modify" && applied === undefined) {
       return { block: true, blockReason: "The Guardian's modification could not be applied." };
+    }
+    if (applied !== undefined && isMessageApprovalRequest(event.toolName, event.params)) {
+      const channel = readStringParam(event.params, "channel") ?? userContext.authentication_method;
+      const modifiedChannel = readStringParam(applied, "channel") ?? userContext.authentication_method;
+      if (!isMessageApprovalRequest(event.toolName, applied) || modifiedChannel !== channel) {
+        auditSubstitution(sessionId, METHODS.toolCallRequest, outcome.requestId, "modify", "approval_request_changed");
+        return { block: true, blockReason: "The Guardian's modification cannot clear an unresolved approval request or change its action or channel." };
+      }
     }
     const mayRunWith = decision.decision === "allow" || decision.decision === "ask" ? event.params : applied;
     if (event.toolName === SPAWN_TOOL && mayRunWith !== undefined) {
@@ -1120,15 +1373,15 @@ export function createHooks({
     }
     switch (decision.decision) {
       case "allow":
-        runWith(event.params);
+        await runWith(event.params);
         // OpenClaw keeps the last `params` a handler returns, and this handler
         // runs last: the call runs with exactly what the Guardian saw.
         return { params: event.params };
       case "modify":
-        runWith(applied!);
+        await runWith(applied!);
         return { params: applied! };
       case "ask":
-        return approvalFor(event.toolName, event.params, decision, run, outcome.requestId, () => runWith(event.params));
+        return approvalFor(event.toolName, event.params, decision, run, outcome.requestId, runWith);
       case "defer":
         auditSubstitution(sessionId, METHODS.toolCallRequest, outcome.requestId, "defer", "defer_unsupported");
         return { block: true, blockReason: `Pending: ${reasoningOf(decision)}` };
@@ -1183,52 +1436,85 @@ export function createHooks({
    */
   async function governToolResult(event: ToolResultEvent, ctx: ToolResultContext): Promise<ToolResultAnswer> {
     const deadlineAt = exchange.deadlineFromNow();
-    const decided = decidedCalls.get(event.toolCallId);
-    decidedCalls.delete(event.toolCallId);
     const runId = ctx.runId;
-    const run = runId === undefined ? undefined : runs.get(runId);
-    if (runId === undefined || run === undefined || (ctx.sessionId !== undefined && ctx.sessionId !== run.sessionId) || (decided !== undefined && decided.run !== run)) {
-      refuse(ctx.sessionId ?? ctx.sessionKey, METHODS.toolCallResult, RUN_NOT_ADMITTED, "the result's run never passed before_agent_run, or is not the run of its call");
+    const admitted = runId === undefined ? undefined : await runFacts.get(runId, "admission");
+    if (runId === undefined || ctx.runtime !== "openclaw" || ctx.sessionKey === undefined || ctx.sessionId === undefined ||
+      !isAdmittedRunContext(admitted, runId, ctx)) {
+      refuse(ctx.sessionId ?? ctx.sessionKey, METHODS.toolCallResult, RUN_NOT_ADMITTED, "the result has no matching admitted run context");
       return WITHHELD_RESULT;
     }
+    const namespace = callNamespace(event.toolCallId);
+    const availableCall = await runFacts.get(runId, namespace);
+    if (!isToolCallContext(availableCall, event, runId, ctx)) {
+      refuse(ctx.sessionId, METHODS.toolCallResult, RUN_NOT_ADMITTED, "the result has no matching tool-call authorization context");
+      return WITHHELD_RESULT;
+    }
+    const call = await runFacts.consume(runId, namespace);
+    if (!isToolCallContext(call, event, runId, ctx)) {
+      refuse(ctx.sessionId, METHODS.toolCallResult, RUN_NOT_ADMITTED, "the result's tool-call authorization context was already consumed or ended");
+      return WITHHELD_RESULT;
+    }
+    decidedCalls.delete(event.toolCallId);
+    const localRun = runs.get(runId);
+    const sessionKey = ctx.sessionKey;
+    const sessionId = ctx.sessionId;
+    const userContext = admitted.userContext;
+    const agentName = typeof admitted.agentName === "string" ? admitted.agentName : undefined;
     const payload: Record<string, unknown> = {
       tool: { name: event.toolName },
-      exit_status: decided !== undefined && !decided.ran ? "blocked" : event.isError === true ? "failure" : "success",
+      exit_status: !call.ran ? "blocked" : event.isError === true ? "failure" : "success",
       outputs: outputsOf(event.result.content),
-      ...(decided?.requestId == null ? {} : { request_id_ref: decided.requestId }),
+      ...(call.requestId == null ? {} : { request_id_ref: call.requestId }),
     };
     const outcome = await exchange.decide({
       method: METHODS.toolCallResult,
-      sessionId: run.sessionId,
-      userContext: run.userContext,
-      agentName: run.agentName,
+      sessionId,
+      userContext,
+      agentName,
       turnId: runId,
       payload,
       modificationDocument: { ...payload },
     }, deadlineAt);
-    if (runs.get(runId) !== run) {
+    const currentAdmission = await runFacts.get(runId, "admission");
+    if (!isAdmittedRunContext(currentAdmission, runId, ctx) ||
+      (localRun !== undefined && runs.get(runId) !== localRun)) {
       return WITHHELD_RESULT;
     }
     const { decision } = outcome;
     if (decision.decision === "modify") {
       const content = contentOf((decision.applied_input as { outputs?: unknown } | undefined)?.outputs);
       if (content === undefined) {
-        auditSubstitution(run.sessionId, METHODS.toolCallResult, outcome.requestId, "modify", "modifications_invalid");
+        auditSubstitution(sessionId, METHODS.toolCallResult, outcome.requestId, "modify", "modifications_invalid");
         return WITHHELD_RESULT;
       }
       return { result: { content } };
     }
-    return isAllowed(outcome, run.sessionId, METHODS.toolCallResult) ? undefined : WITHHELD_RESULT;
+    return isAllowed(outcome, sessionId, METHODS.toolCallResult) ? undefined : WITHHELD_RESULT;
   }
 
-  /** Asks the Guardian about a message's text as `steps/agentResponse`; `isCurrent` is asked again after the wait. */
-  async function responseAllowed(
+  /**
+   * Asks the Guardian about a message's text as `steps/agentResponse`: the
+   * text to send, `undefined` when it is blocked, or `"stale"` when
+   * `isCurrent`, asked again after the wait, fails.
+   */
+  async function decideResponse(
     step: { sessionId: string; userContext: UserContext; agentName?: string; turnId?: string },
     content: string,
     isCurrent: () => boolean,
-  ): Promise<boolean | "stale"> {
-    const outcome = await exchange.decide({ ...step, method: METHODS.agentResponse, payload: textContent(content), modificationDocument: {} });
-    return isCurrent() ? isAllowed(outcome, step.sessionId, METHODS.agentResponse) : "stale";
+  ): Promise<string | undefined | "stale"> {
+    const payload = textContent(content);
+    const outcome = await exchange.decide({ ...step, method: METHODS.agentResponse, payload, modificationDocument: { ...payload } });
+    if (!isCurrent()) {
+      return "stale";
+    }
+    if (outcome.decision.decision === "modify") {
+      const text = textOf((outcome.decision.applied_input as { content?: unknown } | undefined)?.content);
+      if (text === undefined) {
+        auditSubstitution(step.sessionId, METHODS.agentResponse, outcome.requestId, "modify", "modifications_invalid");
+      }
+      return text;
+    }
+    return isAllowed(outcome, step.sessionId, METHODS.agentResponse) ? content : undefined;
   }
 
   return {
@@ -1242,13 +1528,12 @@ export function createHooks({
       if (blockedBecause === undefined) {
         return undefined;
       }
-      // A refused sender gets no reply an approver would weigh: what they
-      // wrote is not kept.
+      // Refused senders do not contribute display identities to approval prompts.
       const senderId = event.senderId ?? ctx.senderId;
       if (senderId !== undefined && ctx.channel !== undefined) {
-        unanswered.delete(personKey(ctx.channel, ctx.accountId, senderId));
+        senderNames.delete(personKey(ctx.channel, ctx.accountId, senderId));
       }
-      return { outcome: "block", reason: blockedBecause, message: config.blockedReplyText };
+      return blockedRun(blockedBecause, config.blockedReplyText);
     },
 
     async beforeDispatch(event, ctx) {
@@ -1262,7 +1547,7 @@ export function createHooks({
         return undefined;
       }
       logger.error(`ACS plugin dropped a message that would join a running turn: ${refusedBecause}`);
-      return { handled: true, text: config.blockedReplyText };
+      return droppedMessage(config.blockedReplyText);
     },
 
     async beforeToolCall(event, ctx) {
@@ -1275,6 +1560,7 @@ export function createHooks({
 
     async gatewayStart() {
       await restored();
+      await runFacts.pruneOtherProcesses();
     },
 
     async toolResult(event, ctx) {
@@ -1292,22 +1578,37 @@ export function createHooks({
       if (callId === undefined) {
         return;
       }
+      const decided = decidedCalls.get(callId);
+      const runId = ctx.runId ?? event.runId;
+      if (decided !== undefined && runId !== undefined) {
+        try {
+          await runFacts.set(runId, callNamespace(callId), toolCallFact({
+            runId,
+            sessionKey: decided.run.sessionKey,
+            sessionId: decided.run.sessionId,
+            toolCallId: callId,
+            toolName: event.toolName,
+            requestId: decided.requestId,
+            ran: decided.ran,
+          }));
+        } catch (error) {
+          logger.error(`ACS plugin could not record tool-call authorization: ${(error as Error).message}`);
+        }
+      }
       sendGrants.delete(callId);
     },
 
     // OpenClaw sends the original reply when this hook throws or runs past its
-    // budget, so every path returns, and every path of a reply to the
-    // session's own sender but an allow returns the fixed text.
+    // budget, so every path returns, and no path but a decided one returns
+    // the original text.
     async messageSending(event, ctx) {
-      const withheld = { content: config.blockedReplyText };
-      // A send of a `message` call to another recipient goes out under the
-      // run that made the call, whatever session OpenClaw files it under (the
-      // recipient's, for a send to another peer), as the Guardian decided it
-      // at the call.
+      // A send of an executed `message` call is that call's action: it goes
+      // out under the run that made the call, whatever session OpenClaw files
+      // it under (the recipient's, for a send to another peer), as the
+      // Guardian decided it at the call.
       try {
-        const grant = typeof event.to === "string" ? grantFor(event.to.trim(), ctx, event.content) : undefined;
-        if (grant !== undefined) {
-          unanswered.delete(personKey(ctx.channelId, ctx.accountId, event.to.trim()));
+        const to = typeof event.to === "string" ? event.to.trim() : undefined;
+        if (to !== undefined && grantFor(to, ctx, event.content) !== undefined) {
           return { content: event.content };
         }
       } catch {
@@ -1337,7 +1638,7 @@ export function createHooks({
         const sessionKey = ctx.sessionKey;
         // The session may end, or another begin under the key, while the
         // Guardian decides: nothing is sent into it.
-        const allowed = await responseAllowed(
+        const decided = await decideResponse(
           {
             sessionId: admitted.sessionId,
             userContext: { user_id: event.to, authentication_method: ctx.channelId },
@@ -1347,32 +1648,27 @@ export function createHooks({
           event.content,
           () => admittedSessions.get(sessionKey) === admitted,
         );
-        if (allowed === "stale") {
+        if (decided === "stale") {
           return { cancel: true };
         }
-        if (!allowed) {
-          return withheld;
+        if (decided === undefined) {
+          return blockedDelivery(config.blockedReplyText);
         }
-        unanswered.delete(personKey(ctx.channelId, ctx.accountId, event.to));
-        return { content: event.content };
-      } catch {
-        return withheld;
+        return { content: decided };
+      } catch (error) {
+        refuse(ctx.sessionKey, METHODS.agentResponse, PLUGIN_FAILED, `the ACS plugin failed: ${error instanceof Error ? error.message : String(error)}`);
+        return blockedDelivery(config.blockedReplyText);
       }
     },
 
-    // Kept for the approval prompt only; no step is sent: the run that reads
-    // the message sends it as steps/userMessage.
     async messageReceived(event, ctx) {
       const person = trimmedString(event.senderId) ?? trimmedString(event.from);
-      if (person === undefined || typeof event.content !== "string" || event.content.trim().length === 0) {
+      const name = trimmedString(event.metadata?.senderName);
+      if (person === undefined || name === undefined) {
         return;
       }
       const key = personKey(ctx.channelId, ctx.accountId, person);
-      const messages = [...(unanswered.get(key) ?? []), truncate(event.content.trim(), APPROVAL_DESCRIPTION_MAX)];
-      while (messages.length > 1 && messages.reduce((total, message) => total + message.length, 0) > APPROVAL_DESCRIPTION_MAX) {
-        messages.shift();
-      }
-      unanswered.set(key, messages);
+      senderNames.set(key, truncate(name.replace(/\s+/g, " "), APPROVAL_DESCRIPTION_MAX));
     },
 
     async agentEnd(event, ctx) {
@@ -1382,14 +1678,19 @@ export function createHooks({
         pending.ended = true;
       }
       const run = runId === undefined ? undefined : runs.get(runId);
+      if (runId !== undefined) {
+        if (run !== undefined) {
+          runs.delete(runId);
+          deleteWhere(sendGrants, (grant) => grant.run === run);
+          deleteWhere(decidedCalls, (call) => call.run === run);
+          if (liveRunOfSession.get(run.sessionKey) === runId) {
+            liveRunOfSession.delete(run.sessionKey);
+          }
+        }
+        await revokeRunFacts(runId);
+      }
       if (runId === undefined || run === undefined) {
         return;
-      }
-      runs.delete(runId);
-      deleteWhere(sendGrants, (grant) => grant.run === run);
-      deleteWhere(decidedCalls, (call) => call.run === run);
-      if (liveRunOfSession.get(run.sessionKey) === runId) {
-        liveRunOfSession.delete(run.sessionKey);
       }
       // Audit only (hooks.md, turnEnd): the turn has happened, so an answer
       // other than allow changes nothing and is recorded.
@@ -1414,13 +1715,19 @@ export function createHooks({
     async sessionEnd(event, ctx) {
       const sessionKey = event.sessionKey ?? ctx.sessionKey;
       const sessionId = event.sessionId ?? ctx.sessionId;
+      const admitted = sessionKey === undefined ? undefined : admittedSessions.get(sessionKey);
       // The process ends, the session does not: its runs end with the process,
       // and its admission and ACS session continue after the restart.
       const processEnds = event.reason !== undefined && PROCESS_END_REASONS.has(event.reason);
       if (sessionKey !== undefined) {
+        const forget = !processEnds && admitted !== undefined && (sessionId === undefined || admitted.sessionId === sessionId)
+          ? forgetAdmission(sessionKey)
+          : undefined;
+        const endedRunIds: string[] = [];
         for (const [runId, run] of runs) {
           if (run.sessionKey === sessionKey) {
             runs.delete(runId);
+            endedRunIds.push(runId);
           }
         }
         deleteWhere(sendGrants, (grant) => grant.run.sessionKey === sessionKey);
@@ -1432,26 +1739,26 @@ export function createHooks({
         }
         liveRunOfSession.delete(sessionKey);
         undecidedInbound.delete(sessionKey);
+        if (sessionId !== undefined) {
+          startedSessions.delete(sessionId);
+        }
+        await Promise.all(endedRunIds.map((runId) => revokeRunFacts(runId)));
+        await forget;
+        if (admitted !== undefined) {
+          const { user_id: person, authentication_method: channel } = admitted.userContext;
+          for (const key of senderNames.keys()) {
+            if (key.startsWith(`${channel}\n`) && key.endsWith(`\n${person}`)) {
+              senderNames.delete(key);
+            }
+          }
+        }
       }
       if (processEnds) {
         return;
       }
-      const admitted = sessionKey === undefined ? undefined : admittedSessions.get(sessionKey);
-      if (sessionKey !== undefined && (sessionId === undefined || admitted?.sessionId === sessionId)) {
-        await forgetAdmission(sessionKey);
-      }
-      if (admitted !== undefined) {
-        const { user_id: person, authentication_method: channel } = admitted.userContext;
-        for (const key of unanswered.keys()) {
-          if (key.startsWith(`${channel}\n`) && key.endsWith(`\n${person}`)) {
-            unanswered.delete(key);
-          }
-        }
-      }
       if (sessionId === undefined) {
         return;
       }
-      startedSessions.delete(sessionId);
       // Audit only (hooks.md, sessionEnd). Sent for a session this process
       // admitted a run to; OpenClaw's next session under the key has a new id
       // and so a new ACS session.
@@ -1482,7 +1789,12 @@ export function createHooks({
  * used or whose deployment fails a requirement. With an audit sink, every
  * step they block is recorded as refused with `reasonCode`.
  */
-export function createBlockingHooks(reason: string, blockedReplyText: string, audit?: AuditSink, reasonCode = "plugin_unconfigured"): Hooks {
+export function createBlockingHooks(
+  reason: string,
+  blockedReplyText: string | undefined,
+  audit?: AuditSink,
+  reasonCode = "plugin_unconfigured",
+): Hooks {
   const refuse = (sessionId: string | undefined, method: string) => {
     if (audit !== undefined) {
       writeRefused(audit, sessionId, method, reasonCode, reason);
@@ -1491,11 +1803,11 @@ export function createBlockingHooks(reason: string, blockedReplyText: string, au
   return {
     async beforeAgentRun(_event, ctx) {
       refuse(ctx.sessionId ?? ctx.sessionKey, METHODS.userMessage);
-      return { outcome: "block", reason, message: blockedReplyText };
+      return blockedRun(reason, blockedReplyText);
     },
     async beforeDispatch(event, ctx) {
       refuse(event.sessionKey ?? ctx.sessionKey, METHODS.userMessage);
-      return { handled: true, text: blockedReplyText };
+      return droppedMessage(blockedReplyText);
     },
     async beforeToolCall(_event, ctx) {
       refuse(ctx.sessionId ?? ctx.sessionKey, METHODS.toolCallRequest);
@@ -1509,7 +1821,7 @@ export function createBlockingHooks(reason: string, blockedReplyText: string, au
     },
     async messageSending(_event, ctx) {
       refuse(ctx.sessionKey, METHODS.agentResponse);
-      return { content: blockedReplyText };
+      return blockedDelivery(blockedReplyText);
     },
     async messageReceived() {},
     async agentEnd() {},
