@@ -53,14 +53,17 @@ import {
   type SpanExporter,
 } from "@opentelemetry/sdk-trace-base";
 import {
-  createFileSpanExporter,
+  asObject,
   DECISION_FAILURE_EVENT,
   decisionFailureAttributes,
   GUARDIAN_ERROR_STATUS,
   loadOtelMapping,
-  SPAN_LIMITS,
+  REPLAY_DETECTED_CODE,
   type FailureClass,
-} from "./otel-trace-exporter.ts";
+  type JsonObject,
+} from "./otel-mapping.ts";
+import { SPAN_LIMITS } from "./otel-trace-exporter.ts";
+import { createFileSpanExporter } from "./otlp-file-exporter.ts";
 
 /**
  * The host's `failure.kind` (packages/host-adapter/src/failure-kinds.ts)
@@ -110,7 +113,6 @@ const GENERIC_DETAIL = "The host recorded a failure this converter does not clas
  * (packages/host-adapter/src/failure-posture.ts). Only the integer is
  * taken; nothing else in the message is copied. */
 const ERROR_CODE_IN_MESSAGE = /^guardian (?:refused the envelope with|returned) error (-?\d+):/;
-const REPLAY_DETECTED_CODE = -32005;
 
 /**
  * The host adapter's `toSessionUuid` (packages/host-adapter/src/build-envelope.ts),
@@ -153,12 +155,6 @@ export type ConversionSummary = {
   /** Lines that were not JSON, not an audit entry, or had no posture. */
   skippedUnreadable: number;
 };
-
-type JsonObject = Record<string, unknown>;
-
-function readObject(value: unknown): JsonObject | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : undefined;
-}
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
@@ -246,7 +242,7 @@ export async function convertAuditLog(auditPath: string, otelPath: string, mappi
     if (line.trim() === "") continue;
     let entry: JsonObject | undefined;
     try {
-      entry = readObject(JSON.parse(line));
+      entry = asObject(JSON.parse(line));
     } catch {
       entry = undefined;
     }
@@ -267,7 +263,7 @@ export async function convertAuditLog(auditPath: string, otelPath: string, mappi
       summary.skippedUnreadable += 1;
       continue;
     }
-    const failure = readObject(entry.failure) ?? {};
+    const failure = asObject(entry.failure) ?? {};
     const kind = readString(failure.kind);
     const method = readString(entry.method);
     if (method === undefined) {
@@ -294,10 +290,11 @@ export async function convertAuditLog(auditPath: string, otelPath: string, mappi
     if (sessionId !== undefined) {
       attributes["acs.session.id"] = sessionUuid(sessionId);
     }
-    // The host builds every envelope with its JSON-RPC id equal to
-    // params.request_id (build-envelope.ts), so the entry's rpc_id is the
-    // request id the Guardian's span for the same request carries.
-    const requestId = readString(entry.rpc_id);
+    // The entry's request_id is the id the Guardian's span for the same
+    // request carries. Entries written before that field existed have only
+    // rpc_id, which equalled params.request_id whenever the host did not
+    // derive the request id from its own call id.
+    const requestId = readString(entry.request_id) ?? readString(entry.rpc_id);
     if (requestId !== undefined) {
       attributes["acs.request_id"] = requestId;
     }

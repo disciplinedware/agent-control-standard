@@ -89,6 +89,8 @@ import {
   isToolCallResult,
   validateEnvelope,
   type AcsRequestEnvelope,
+  type ToolCallRequestEnvelope,
+  type ToolCallResultEnvelope,
 } from "./validate-envelope.ts";
 import { checkResponse } from "./check-response.ts";
 import { buildServerHello, type ServerHello } from "./handshake.ts";
@@ -100,6 +102,7 @@ import {
   type IfcLabels,
   type SessionContextStore,
 } from "./session-context-store.ts";
+import type { StepFindings } from "./session-context.ts";
 import { persistIfcLabels, supplySourceLabels } from "./ifc-labels.ts";
 
 /**
@@ -471,20 +474,16 @@ export async function startGuardian({
   return {
     url: `http://localhost:${server.port}${ACS_PATH}`,
     async close() {
-      if (traceExporter === NULL_OTEL_TRACE_EXPORTER) {
-        // No exporter, nothing to close behind the drain: the close every
-        // Guardian had before trace export existed.
-        await server.stop(true);
-        return;
-      }
-      // Bun.serve's stop(true) closes every connection at once but resolves
-      // only when every in-flight handler has returned -- and a handler whose
-      // bridge never answers never returns. The drain is therefore bounded by
-      // the negotiated timeout: past it, no host is still waiting for the
-      // answer. The timer is unref'd so a prompt stop does not leave it
-      // holding the process open. The exporter shuts down after the drain,
-      // so a step still open then is closed as the failure it is rather
-      // than lost.
+      // The same close whether trace export is on or off:
+      // NULL_OTEL_TRACE_EXPORTER's shutdown resolves at once, so with export
+      // off the drain is all that remains. Bun.serve's stop(true) closes
+      // every connection at once, and on Bun 1.3.11 it resolves only when
+      // every in-flight handler has returned. A handler whose bridge never
+      // answers never returns, so the drain is bounded by the negotiated
+      // timeout: past it, no host is still waiting for the answer. The timer
+      // is unref'd so a prompt stop does not leave it holding the process
+      // open. The exporter shuts down after the drain, so a step still open
+      // then is closed as the failure it is rather than lost.
       const deadline = new Promise<void>((resolve) => {
         setTimeout(resolve, hello.timeout_config.default_ms).unref();
       });
@@ -578,7 +577,7 @@ async function handleAcsRequest(
 
   let response: JsonRpcSuccess | JsonRpcFailure;
   try {
-    response = await dispatch(raw, bridge, mapping, onDecisionFailure, sessionContextStore);
+    response = await dispatch(raw, bridge, mapping, onDecisionFailure, sessionContextStore, envelopeLog);
   } catch (error) {
     // The outer net. Deliberately a bare JSON-RPC error, not an ACS `deny`:
     // this route is `dispatch` rethrowing entirely past denyOnInvalidEnvelope
@@ -716,12 +715,115 @@ async function readCappedBody(req: Request): Promise<CappedBody> {
     : { withinLimit: true, text: text + decoder.decode() };
 }
 
+/**
+ * What this Guardian establishes about a step as it arrives, before the step
+ * is appended to the chain.
+ *
+ * `request_id_ref_unresolved`: hooks.md, toolCallResult. A Guardian SHOULD
+ * resolve `request_id_ref` against the session's `toolCallRequest` records and
+ * MUST record one it cannot resolve. The decision is left to policy, so this
+ * only records. Resolution reads the session's own requests, because
+ * `request_id` is unique only within a session. A restart or an eviction
+ * makes an older reference unresolvable, and that is recorded too.
+ *
+ * `request_id_duplicate`: Specification §10.3 says a Guardian MUST reject a
+ * `request_id` the session has already carried, on any method. This Guardian
+ * does not enforce that yet, so it records the repeat instead.
+ *
+ * The findings go onto the step's own chain entry, which is this Guardian's
+ * audit record, and a copy goes to the envelope log (or stderr) for reading.
+ */
+function examineStep(
+  envelope: ToolCallRequestEnvelope | ToolCallResultEnvelope,
+  sessionContextStore: SessionContextStore,
+  envelopeLog: EnvelopeLogSink,
+): StepFindings | undefined {
+  const sessionId = envelope.params.metadata.session_id;
+  const requestId = envelope.params.request_id;
+  const findings: StepFindings["findings"] = [];
+  let unresolvedRef: string | undefined;
+
+  if (sessionContextStore.hasRequestId(sessionId, requestId)) {
+    findings.push("request_id_duplicate");
+    recordFinding(envelopeLog, { finding: "request_id_duplicate", session_id: sessionId, request_id: requestId }, envelope.method, envelope.id);
+  }
+
+  const ref = isToolCallResult(envelope) ? envelope.params.payload.request_id_ref : undefined;
+  if (ref !== undefined && !sessionContextStore.hasToolCallRequest(sessionId, ref)) {
+    findings.push("request_id_ref_unresolved");
+    unresolvedRef = ref;
+    recordFinding(
+      envelopeLog,
+      { finding: "request_id_ref_unresolved", session_id: sessionId, request_id: requestId, request_id_ref: ref },
+      envelope.method,
+      envelope.id,
+    );
+  }
+
+  if (findings.length === 0) {
+    return undefined;
+  }
+  return unresolvedRef === undefined ? { findings } : { findings, request_id_ref: unresolvedRef };
+}
+
+/**
+ * examineStep, unable to throw. A caller-supplied store that throws on the
+ * lookup costs the findings, never the decision.
+ */
+function examineStepSafely(
+  envelope: ToolCallRequestEnvelope | ToolCallResultEnvelope,
+  sessionContextStore: SessionContextStore,
+  envelopeLog: EnvelopeLogSink,
+): StepFindings | undefined {
+  try {
+    return examineStep(envelope, sessionContextStore, envelopeLog);
+  } catch (error) {
+    reportCheckFailure("step findings", error);
+    return undefined;
+  }
+}
+
+/**
+ * Writes a finding to the envelope log, or, when no envelope log was
+ * configured or it disabled itself after a write error, to stderr as
+ * `acs-finding ` followed by one JSON object carrying the same fields the log
+ * line would. Never throws: a finding is a record, and losing the record must
+ * never cost the decision it sits beside.
+ */
+function recordFinding(
+  envelopeLog: EnvelopeLogSink,
+  finding: Record<string, unknown>,
+  method: string,
+  rpcId: string | number | null,
+): void {
+  if (envelopeLog.write("finding", finding, method, rpcId)) {
+    return;
+  }
+  try {
+    console.error(
+      `acs-finding ${JSON.stringify({ recorded_at: new Date().toISOString(), method, rpc_id: rpcId, ...finding })}`,
+    );
+  } catch {
+    // stderr itself failed (an EPIPE, say). Nothing is left to report to.
+  }
+}
+
+/** One stderr line for a check that threw, itself unable to throw. */
+function reportCheckFailure(check: string, error: unknown): void {
+  try {
+    console.error(`${check} check failed: ${error instanceof Error ? error.message : String(error)}`);
+  } catch {
+    // stderr itself failed. The decision still goes ahead.
+  }
+}
+
 async function dispatch(
   raw: unknown,
   bridge: PolicyBridge<GuardianSnapshot>,
   mapping: Mapping,
   onDecisionFailure: "proceed" | "deny" | undefined,
   sessionContextStore: SessionContextStore,
+  envelopeLog: EnvelopeLogSink,
 ): Promise<JsonRpcSuccess | JsonRpcFailure> {
   const rpcId = extractId(raw);
 
@@ -777,12 +879,16 @@ async function dispatch(
   //     shape. Anything neither predicate answers falls past both, to
   //     METHOD_NOT_DISPATCHED_CODE below.
   if (isToolCallRequest(envelope)) {
-    return await evaluateStep(raw, envelope, assemblePreToolCallSnapshot, bridge, mapping, sessionContextStore);
+    // Examined before evaluateStep appends this step, so a request id is in
+    // the session already only if an earlier step carried it.
+    const findings = examineStepSafely(envelope, sessionContextStore, envelopeLog);
+    return await evaluateStep(raw, envelope, assemblePreToolCallSnapshot, bridge, mapping, sessionContextStore, findings);
   }
 
   // The result gate, beside the request gate rather than merged into it.
   if (isToolCallResult(envelope)) {
-    return await evaluateStep(raw, envelope, assemblePostToolCallSnapshot, bridge, mapping, sessionContextStore);
+    const findings = examineStepSafely(envelope, sessionContextStore, envelopeLog);
+    return await evaluateStep(raw, envelope, assemblePostToolCallSnapshot, bridge, mapping, sessionContextStore, findings);
   }
 
   // A well-formed envelope (it passed validateEnvelope: the method matched
@@ -861,6 +967,7 @@ async function evaluateStep<E extends SteppedEnvelope>(
   bridge: PolicyBridge<GuardianSnapshot>,
   mapping: Mapping,
   sessionContextStore: SessionContextStore,
+  findings?: StepFindings,
 ): Promise<JsonRpcSuccess | JsonRpcFailure> {
   try {
     // The chain entry is appended on arrival, before any verdict exists: a
@@ -871,6 +978,7 @@ async function evaluateStep<E extends SteppedEnvelope>(
       method: envelope.method,
       request_id: envelope.params.request_id,
       tool_name: envelope.params.payload.tool.name,
+      ...findings,
     });
 
     // Resolved BEFORE the snapshot is assembled, where it used to be resolved

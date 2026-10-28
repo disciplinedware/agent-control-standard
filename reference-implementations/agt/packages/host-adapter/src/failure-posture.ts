@@ -264,6 +264,8 @@ export type ApplyFailurePostureInput = {
    * knowable. Never a host's own event name -- see AuditEntry.method. */
   method: string | null;
   rpcId: string | number | null;
+  /** The envelope's `params.request_id`, or null when no request was built. */
+  requestId?: string | null;
   /** Required, not optional: §6.4 makes auditing non-skippable. */
   audit: AuditSink;
   /**
@@ -312,6 +314,7 @@ export function applyFailurePosture({
   sessionId,
   method,
   rpcId,
+  requestId = null,
   audit,
   stage = "delivery",
   hostPosture,
@@ -347,6 +350,7 @@ export function applyFailurePosture({
         session_id: sessionId,
         method,
         rpc_id: rpcId,
+        request_id: requestId,
         posture,
         posture_source: postureSource,
         outcome,

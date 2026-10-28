@@ -38,11 +38,13 @@ To see a decision without an agent client, pipe a hook payload into the Claude C
 
 1. The raw envelope is appended to the envelope log, before anything else.
 2. The envelope is validated against `request-envelope.json`. A `steps/toolCallRequest` or `steps/toolCallResult` is also validated against its own payload schema. An invalid envelope on a `steps/*` method is answered with an honoured `deny`, not a bare error, so the host has a decision to act on.
-3. The AGT intervention point for the method is resolved from `mapping.yaml`, and so is the argument the policy target is read from for the tool the payload names.
-4. The AGT snapshot is assembled, one shape per gate, and evaluated through the bridge.
-5. The verdict is mapped to an ACS decision with the tables in `mapping.yaml`. A `transform` becomes a `modify` whose modification differs by gate: a parameter override at the request gate, a redaction on the result payload at the result gate.
-6. One entry is appended to the session's hash chain. Information-flow labels AGT emitted are stored, so the next step of the session sends them back as input.
-7. The outgoing response is checked against `response-envelope.json`. The result is logged on stderr and never thrown. The response is then recorded and sent.
+3. A `steps/toolCallResult` whose `request_id_ref` names no `toolCallRequest` in the session gets the finding `request_id_ref_unresolved` on its own hash-chain entry (step 8), because `hooks.md` requires the Guardian to record a reference it cannot resolve. A readable copy goes to the envelope log as a `finding` line, or to stderr as an `acs-finding` line when there is no envelope log or it has disabled itself. The decision is left to policy. Both shipped hookmaps name the host's per-call id as `call_id` (`tool_use_id` for Claude Code, `callID` for OpenCode). The shim derives the request's `request_id` from it and sends the same value as the result's `request_id_ref`. A host that leaves the id out gets a random `request_id` and no reference. Results are governed only for the tools the hookmaps name, and Claude Code reports a failed call through `PostToolUseFailure`, which isn't mapped, so a failed call sends no result.
+4. A step whose `request_id` an earlier step in the session already carried gets a `request_id_duplicate` finding the same way, and is still decided.
+5. The AGT intervention point for the method is resolved from `mapping.yaml`, and so is the argument the policy target is read from for the tool the payload names.
+6. The AGT snapshot is assembled, one shape per gate, and evaluated through the bridge.
+7. The verdict is mapped to an ACS decision with the tables in `mapping.yaml`. A `transform` becomes a `modify` whose modification differs by gate: a parameter override at the request gate, a redaction on the result payload at the result gate.
+8. One entry is appended to the session's hash chain. Information-flow labels AGT emitted are stored, so the next step of the session sends them back as input.
+9. The outgoing response is checked against `response-envelope.json`. The result is logged on stderr and never thrown. The response is then recorded and sent.
 
 `handshake/hello` is answered with a constant ServerHello that names exactly the methods this Guardian dispatches: `steps/toolCallRequest` and `steps/toolCallResult`. The Guardian does not read the ClientHello. Any other method is answered with a JSON-RPC error carrying `METHOD_NOT_DISPATCHED_CODE`, which the conformance harness reads back to confirm the ServerHello tells the truth.
 
@@ -149,6 +151,8 @@ await guardian.close();
 
 `StartGuardianOptions` also accepts `hostname`, `envelopeLogPath`, `sessionContextLog`, `otelTraceFile`, `otelTraceEndpoint` and `onDecisionFailure`, which mirror the environment variables above, and five options for tests: `mappingPath`, `annotator`, `bridge`, `sessionContextStore` and `traceExporter`. Each is documented where it is declared, in `src/server.ts`.
 
+`otelTraceEndpoint` leaves the proxy variables alone. `src/main.ts` prints the proxy warning and adds a loopback endpoint's host to whichever of `NO_PROXY` and `no_proxy` is set, or to both when neither is. An embedder that wants the same imports `loopbackProxyWarning` and `keepLoopbackOffProxy` from `guardian` and calls each with `(endpoint, process.env)` before it starts the Guardian.
+
 The package has two entry points. `guardian` exports the governance verbs listed in `src/index.ts`. `guardian/deployment` exports `createDeploymentBridge`, the one function that builds the deployment's bridge with the egress annotator wired in. The conformance harness imports the second so it measures the bridge the Guardian ships, not a replica.
 
 ## Files
@@ -167,7 +171,10 @@ The package has two entry points. `guardian` exports the governance verbs listed
 | `src/deny-on-invalid-envelope.ts` | Turns a schema failure on a `steps/*` method into an honoured `deny` |
 | `src/session-context-store.ts`, `src/session-context.ts`, `src/ifc-labels.ts` | The per-session hash chain, provenance, and information-flow labels |
 | `src/envelope-log-sink.ts` | The envelope log writer |
-| `src/otel-trace-exporter.ts` | The OpenTelemetry span exporter and its OTLP/JSON file writer |
+| `src/otel-trace-exporter.ts` | The OpenTelemetry span exporter, assembled from the three files below |
+| `src/otel-mapping.ts` | Reads `otel-mapping.json`, and says which envelope field feeds each span attribute |
+| `src/otlp-file-exporter.ts` | The OTLP/JSON file writer |
+| `src/loopback-proxy.ts` | Keeps a loopback trace endpoint off an HTTP proxy, applied by `src/main.ts` |
 | `src/audit-to-otlp.ts` | Converts the host adapter's audit log into the same OTLP/JSON file |
 | `src/acs-result.ts` | The decision result type |
 
