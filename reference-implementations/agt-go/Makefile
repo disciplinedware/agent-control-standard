@@ -11,9 +11,7 @@ IMAGE_PLATFORM ?= linux/$(shell $(GO) env GOHOSTARCH)
 IMAGE_OUTPUT ?= type=oci,dest=.acs/acs-guardian.oci.tar
 
 ifneq ($(EVALUATOR),agt)
-ifneq ($(EVALUATOR),go)
-$(error EVALUATOR must be agt or go)
-endif
+$(error EVALUATOR must be agt)
 endif
 export GOOS GOARCH
 EXE := $(if $(filter windows,$(GOOS)),.exe,)
@@ -48,7 +46,7 @@ BUILD_TAGS := $(if $(filter agt,$(EVALUATOR)),-tags agteval,)
 check-start = $(if $(ACS_CHECK_PROGRESS),@printf '[check] RUN: %s\n' '$(1)')
 check-pass = $(if $(ACS_CHECK_PROGRESS),@printf '[check] PASS: %s\n' '$(1)')
 
-.PHONY: all help setup agt-native load build dev-secret run test test-race host-target image image-check example-runtime codex-example opencode-example require-bun require-conformance-deps example-check conformance fmt fmt-check vet lint vulncheck tidy-check coverage docs-check native-flags-check native-flags check check-all
+.PHONY: all help setup agt-native load build dev-secret run test test-race host-target image image-check example-runtime codex-example opencode-example require-bun require-conformance-deps example-check conformance fmt files-check fmt-check vet lint vulncheck tidy-check coverage docs-check native-flags-check native-flags check check-all
 
 all: build
 
@@ -57,19 +55,19 @@ help:
 		'setup             install dependencies required by the quality gate' \
 		'agt-native        build the AGT runtime library and fetch opa, as agt-native.lock pins' \
 		'build             compile every package and the Guardian with AGT' \
-		'run               build and run the selected evaluator on this host' \
-		'test              test the selected evaluator on this host' \
+		'run               build and run the Guardian on this host' \
+		'test              test the Guardian on this host' \
 		'image             build Linux images with Docker Buildx, without publishing' \
 		'image-check       run the local image through shared conformance probes' \
-		'EVALUATOR=agt|go   select the implementation; default: agt' \
+		'EVALUATOR=agt      select the implementation; default: agt' \
 		'GOOS, GOARCH      select the build target; default: this host' \
-		'test-race         run every test with the Go evaluator and the race detector' \
+		'test-race         run the tests that need no AGT runtime, with the race detector' \
 		'codex-example     start the Guardian and a governed Codex session' \
 		'opencode-example  start the Guardian and a governed OpenCode session' \
 		'example-check     test the custom engine and host adapters' \
 		'conformance       run the shared ACS harness against this Guardian' \
 		'docs-check        validate documentation links and named tests' \
-		'load              measure the selected evaluator under concurrent clients (docs/load.md)' \
+		'load              measure the Guardian under concurrent clients (docs/load.md)' \
 		'check             run the complete local quality gate'
 
 setup: host-target require-bun agt-native
@@ -138,7 +136,7 @@ codex-example: example-runtime
 opencode-example: example-runtime
 	@command -v opencode >/dev/null || { printf '%s\n' 'opencode is required on PATH'; exit 1; }
 	$(GO) build -o .acs/bin/acs-opencode-hook ./examples/opencode/cmd/acs-opencode-hook
-	scripts/run-host-example.sh opencode
+	ACS_OPENCODE_HMAC_KEY_ID=2026-10 scripts/run-host-example.sh opencode
 
 example-check: example-runtime require-bun
 	$(call check-start,Examples)
@@ -146,7 +144,7 @@ example-check: example-runtime require-bun
 	$(GO) test ./examples/codex/cmd/acs-codex-hook
 	$(GO) test ./examples/opencode/cmd/acs-opencode-hook
 	$(GO) build -o .acs/bin/acs-opencode-hook ./examples/opencode/cmd/acs-opencode-hook
-	ACS_HOST_EXAMPLE_PORT=0 scripts/run-host-example.sh bun test examples/opencode/plugin.test.mjs
+	ACS_HOST_EXAMPLE_PORT=0 ACS_OPENCODE_HMAC_KEY_ID=2026-10 scripts/run-host-example.sh bun test examples/opencode/plugin.test.mjs
 	ACS_HOST_EXAMPLE_PORT=0 ACS__SECURITY__HMAC_KEY_ID=openclaw-e2e ACS_HMAC_KEY_ID=openclaw-e2e ACS_HMAC_SECRET_FILE='$(CURDIR)/.acs/hmac-secret' scripts/run-host-example.sh bun test ../../adapters/openclaw/tests/go-guardian.e2e.ts
 	bash -n scripts/run-host-example.sh
 	$(call check-pass,Examples)
@@ -158,6 +156,11 @@ conformance: example-runtime require-bun require-conformance-deps
 
 fmt:
 	$(GO) fmt ./...
+
+files-check:
+	$(call check-start,Tracked files)
+	scripts/check-tracked-files.sh
+	$(call check-pass,Tracked files)
 
 fmt-check:
 	$(call check-start,Formatting)
@@ -220,10 +223,4 @@ native-flags:
 check:
 	@bash scripts/check.sh '$(MAKE)'
 
-check-all: host-target fmt-check tidy-check native-flags-check vet lint vulncheck build test-race test example-check conformance coverage docs-check
-	$(MAKE) build EVALUATOR=go
-	$(MAKE) test EVALUATOR=go
-ifneq ($(EVALUATOR),agt)
-	$(MAKE) build EVALUATOR=agt
-	$(MAKE) test EVALUATOR=agt
-endif
+check-all: host-target files-check fmt-check tidy-check native-flags-check vet lint vulncheck build test-race test example-check conformance coverage docs-check

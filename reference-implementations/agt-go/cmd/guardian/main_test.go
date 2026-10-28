@@ -1,3 +1,5 @@
+//go:build agteval
+
 package main_test
 
 import (
@@ -66,12 +68,17 @@ func referenceConfig(t *testing.T) string {
 // comes from the module, while every mutable test value is an ACS__ override.
 func start(t *testing.T, bin, dir string, env ...string) *process {
 	t.Helper()
+	return startWith(t, bin, dir, referenceConfig(t), env...)
+}
+
+func startWith(t *testing.T, bin, dir, config string, env ...string) *process {
+	t.Helper()
 	logs := t.TempDir()
 	secretFile := filepath.Join(logs, "hmac-secret")
 	if err := os.WriteFile(secretFile, []byte(base64.StdEncoding.EncodeToString([]byte(secret))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "--config", referenceConfig(t))
+	cmd := exec.Command(bin, "--config", config)
 	prepareProcess(cmd)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -112,7 +119,12 @@ func start(t *testing.T, bin, dir string, env ...string) *process {
 
 func (p *process) client(t *testing.T) *observedagent.Client {
 	t.Helper()
-	signer, err := guardian.NewHMACSigner(guardian.HMACKey{ID: "2026-10", Secret: []byte(secret)})
+	return p.clientWith(t, guardian.HMACKey{ID: "2026-10", Secret: []byte(secret)})
+}
+
+func (p *process) clientWith(t *testing.T, key guardian.HMACKey) *observedagent.Client {
+	t.Helper()
+	signer, err := guardian.NewHMACSigner(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +188,79 @@ func TestServesDecisions(t *testing.T) {
 	}
 }
 
+// TestServesThePreviousHMACKey: an agent on a key in
+// security.hmac_previous_keys and an agent on the current key are both
+// answered, each under its own key.
+func TestServesThePreviousHMACKey(t *testing.T) {
+	bin := build(t)
+	const previousSecret = "fedcba9876543210fedcba9876543210"
+	p := startWith(t, bin, ".", configWithPreviousKeys(t, "2026-09", secretFile(t, previousSecret)))
+	for name, key := range map[string]guardian.HMACKey{
+		"current":  {ID: "2026-10", Secret: []byte(secret)},
+		"previous": {ID: "2026-09", Secret: []byte(previousSecret)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := p.clientWith(t, key)
+			ctx := context.Background()
+			if o, err := c.Handshake(ctx, observedagent.DefaultHello(handshake.CoreMethods()...)); err != nil || o.Hello == nil || !o.Verified {
+				t.Fatalf("handshake: %v %s", err, o.Raw)
+			}
+			o, err := c.Send(ctx, observedagent.Request{Method: acs.StepToolCallRequest, Payload: shell("ls -la")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if o.Result == nil || !o.Verified || o.Result.Disposition != acs.Allow {
+				t.Fatalf("got %s", o.Raw)
+			}
+		})
+	}
+	c := p.clientWith(t, guardian.HMACKey{ID: "2026-08", Secret: []byte(previousSecret)})
+	if o, err := c.Handshake(context.Background(), observedagent.DefaultHello(handshake.CoreMethods()...)); err != nil || o.Hello != nil || o.Error == nil || o.Error.Code != acs.SignatureInvalid {
+		t.Fatalf("a key_id the Guardian does not hold got %v %s, want SIGNATURE_INVALID", err, o.Raw)
+	}
+}
+
+// configWithPreviousKeys writes guardian.yaml, with absolute paths and one
+// entry in security.hmac_previous_keys, to a temporary file.
+func configWithPreviousKeys(t *testing.T, keyID, secretFile string) string {
+	t.Helper()
+	module := mustAbs(t, "../..")
+	raw, err := os.ReadFile(referenceConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for from, to := range map[string]string{
+		"deployment_dir: ../agt":               "deployment_dir: " + filepath.Join(module, "../agt"),
+		"opa_path: .acs/agt/bin":               "opa_path: " + filepath.Join(module, ".acs/agt/bin"),
+		"hmac_secret_file: .acs/hmac-secret\n": "hmac_secret_file: .acs/hmac-secret\n  hmac_previous_keys:\n    - key_id: " + yamlString(keyID) + "\n      secret_file: " + yamlString(secretFile) + "\n",
+	} {
+		if !strings.Contains(text, from) {
+			t.Fatalf("guardian.yaml no longer has %q", from)
+		}
+		text = strings.Replace(text, from, to, 1)
+	}
+	path := filepath.Join(t.TempDir(), "guardian.yaml")
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// yamlString single-quotes s, so a Windows path keeps its backslashes.
+func yamlString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func secretFile(t *testing.T, value string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hmac-secret")
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString([]byte(value))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func mustAbs(t *testing.T, dir string) string {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -194,14 +279,22 @@ func TestRefusesToStart(t *testing.T) {
 		{"configuration_required", "", "--config is required", nil, nil},
 		{"short_secret", base64.StdEncoding.EncodeToString([]byte("short")), "decodes to 5 bytes, fewer than 32", []string{"--config", referenceConfig(t)}, nil},
 		{"secret_not_base64", "not base64!", "is not standard base64", []string{"--config", referenceConfig(t)}, nil},
+		{"read_timeout_within_decision", base64.StdEncoding.EncodeToString([]byte(secret)), "server.read_timeout must be at least protocol.decision_timeout minus protocol.answer_margin", []string{"--config", referenceConfig(t)}, []string{"ACS__SERVER__READ_TIMEOUT=1s"}},
 		{"write_timeout_within_decision", base64.StdEncoding.EncodeToString([]byte(secret)), "server.write_timeout must exceed protocol.decision_timeout", []string{"--config", referenceConfig(t)}, []string{"ACS__SERVER__WRITE_TIMEOUT=5s"}},
 		{"non_positive_deferral_limit", base64.StdEncoding.EncodeToString([]byte(secret)), "limits.max_deferrals must be positive", []string{"--config", referenceConfig(t)}, []string{"ACS__LIMITS__MAX_DEFERRALS=0"}},
 		{"unknown_ask_substitution", base64.StdEncoding.EncodeToString([]byte(secret)), "policy.ask_substitution must be none, deny or defer", []string{"--config", referenceConfig(t)}, []string{"ACS__POLICY__ASK_SUBSTITUTION=ask"}},
 		{"unknown_override", base64.StdEncoding.EncodeToString([]byte(secret)), "invalid keys", []string{"--config", referenceConfig(t)}, []string{"ACS__NO__SUCH__SETTING=value"}},
 		{"unknown_storage_provider", base64.StdEncoding.EncodeToString([]byte(secret)), `storage.provider must be "memory"`, []string{"--config", referenceConfig(t)}, []string{"ACS__STORAGE__PROVIDER=redis"}},
-		{"negative_audit_rotation", base64.StdEncoding.EncodeToString([]byte(secret)), "audit: max_file_bytes and max_files cannot be negative", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_FILES=-1"}},
-		{"audit_files_without_a_size", base64.StdEncoding.EncodeToString([]byte(secret)), "audit: max_files needs max_file_bytes", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_FILE_BYTES=0"}},
-		{"audit_size_without_files", base64.StdEncoding.EncodeToString([]byte(secret)), "audit: max_file_bytes needs max_files", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_FILES=0"}},
+		{"negative_envelope_rotation", base64.StdEncoding.EncodeToString([]byte(secret)), "audit.max_envelope_file_bytes and audit.max_envelope_files: the file size and the file count cannot be negative", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_ENVELOPE_FILES=-1"}},
+		{"envelope_files_without_a_size", base64.StdEncoding.EncodeToString([]byte(secret)), "audit.max_envelope_file_bytes and audit.max_envelope_files: a file count needs a file size", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_ENVELOPE_FILE_BYTES=0"}},
+		{"envelope_size_without_files", base64.StdEncoding.EncodeToString([]byte(secret)), "audit.max_envelope_file_bytes and audit.max_envelope_files: a file size needs a file count of at least 1", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_ENVELOPE_FILES=0"}},
+		{"event_size_without_files", base64.StdEncoding.EncodeToString([]byte(secret)), "audit.max_event_file_bytes and audit.max_event_files: a file size needs a file count of at least 1", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_EVENT_FILES=0"}},
+		{"retired_audit_key", base64.StdEncoding.EncodeToString([]byte(secret)), "invalid keys", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_FILES=3"}},
+		{"non_positive_audit_queue_records", base64.StdEncoding.EncodeToString([]byte(secret)), "audit.max_queue_records must be positive", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_QUEUE_RECORDS=0"}},
+		{"previous_key_without_a_key_id", base64.StdEncoding.EncodeToString([]byte(secret)), "security.hmac_previous_keys[0].key_id must not be empty", []string{"--config", configWithPreviousKeys(t, "", secretFile(t, secret))}, nil},
+		{"previous_key_id_equal_to_the_current", base64.StdEncoding.EncodeToString([]byte(secret)), `security.hmac_previous_keys[0].key_id "2026-10" is already used by another key`, []string{"--config", configWithPreviousKeys(t, "2026-10", secretFile(t, secret))}, nil},
+		{"previous_key_without_a_secret_file", base64.StdEncoding.EncodeToString([]byte(secret)), "security.hmac_previous_keys[0].secret_file", []string{"--config", configWithPreviousKeys(t, "2026-09", "")}, nil},
+		{"audit_queue_smaller_than_a_request", base64.StdEncoding.EncodeToString([]byte(secret)), "audit.max_queue_bytes must be at least 2097408 to hold one request of limits.max_body_bytes", []string{"--config", referenceConfig(t)}, []string{"ACS__AUDIT__MAX_QUEUE_BYTES=2097407"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

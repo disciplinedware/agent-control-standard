@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	jsonv2 "github.com/go-json-experiment/json"
@@ -149,21 +150,26 @@ func replayDetected(in *call) reply {
 // default proceeds.
 func (g *Guardian) step(ctx context.Context, in *call, req acs.Request) (r reply) {
 	chainHash := ""
+	var final acs.Decision
 	defer func() {
 		if p := recover(); p != nil {
 			g.failure(ctx, req.Method, in.SessionID, in.RequestID, "step panic", fmt.Errorf("panic: %v", p))
-			r = g.answerStep(ctx, in, denial(disposition.ReasonEvaluationFailed, "the Guardian failed while deciding the step"), chainHash)
+			r = g.answerStep(ctx, in, g.replacing(ctx, in, req, final, denial(disposition.ReasonEvaluationFailed, "the Guardian failed while deciding the step")), chainHash)
 		}
 	}()
-
-	lockCtx, release, err := g.cfg.Store.Lock(ctx, in.SessionID)
+	// Lock and Load run under this Guardian's deadline, since the session's
+	// own terms are known only once it is loaded; the rest runs under them.
+	loaded := in.ArrivedAt.Add(g.cfg.DecisionTimeout - g.cfg.AnswerMargin)
+	lockCtx, release, err := g.lock(ctx, in.SessionID, loaded)
 	if err != nil {
 		return g.storeFailed(ctx, in, "store lock", err)
 	}
 	defer release()
 	ctx = lockCtx
 
-	sess, ok, err := g.cfg.Store.Load(ctx, in.SessionID)
+	loadCtx, cancelLoad := context.WithDeadline(lockCtx, loaded)
+	sess, ok, err := g.cfg.Store.Load(loadCtx, in.SessionID)
+	cancelLoad()
 	switch {
 	case err != nil:
 		return g.storeFailed(ctx, in, "store load", err)
@@ -178,6 +184,9 @@ func (g *Guardian) step(ctx context.Context, in *call, req acs.Request) (r reply
 		return g.answerStep(ctx, in, denial(disposition.ReasonAgentIDNotBound, "the request names agent_id "+req.Params.Metadata.AgentID+", and the session was opened by another agent; a session answers only the agent that opened it"), "")
 	}
 	chainHash = sess.Head
+	decided, recorded := g.deadlines(in, sess.Handshake.Server, req.Method)
+	ctx, cancelDecision := context.WithDeadline(lockCtx, decided)
+	defer cancelDecision()
 	if outside := g.timestampOutsideWindow(in, sess.Handshake.Server.SkewWindowMS); outside != nil {
 		return *outside
 	}
@@ -219,10 +228,13 @@ func (g *Guardian) step(ctx context.Context, in *call, req acs.Request) (r reply
 	case err != nil:
 		return g.storeFailed(ctx, in, "store append", err)
 	}
-	g.recordUnresolvedReference(ctx, in, req, sess.Entries)
+	unresolvedErr := g.recordUnresolvedReference(ctx, in, req, sess.Entries)
 	sess.Entries = append(slices.Clip(sess.Entries), entry)
 	sess.Head = entry.EntryHash
 	chainHash = sess.Head
+	if unresolvedErr != nil {
+		return g.answerStep(ctx, in, g.auditUnavailable(ctx, in, req, unresolvedErr, acs.Decision{}), sess.Head)
+	}
 	if established != nil {
 		sess.Intent = established
 	}
@@ -233,6 +245,10 @@ func (g *Guardian) step(ctx context.Context, in *call, req acs.Request) (r reply
 	} else {
 		pd = g.decide(ctx, in, req, sess)
 	}
+	// The decision is made; recording it must not fail for the deadline the
+	// decision ran under, so it runs to a deadline of its own.
+	ctx, cancelAnswer := context.WithDeadline(lockCtx, recorded)
+	defer cancelAnswer()
 	if _, ok := g.decisionReply(in, pd.Decision, sess.Head); !ok {
 		err := errors.New("the policy engine returned a decision that fails response-envelope.json")
 		g.failure(ctx, req.Method, in.SessionID, in.RequestID, "policy engine decision", err)
@@ -247,14 +263,16 @@ func (g *Guardian) step(ctx context.Context, in *call, req acs.Request) (r reply
 			pd.Decision)
 	}
 
+	final = d
+	replacing := func(r acs.Decision) acs.Decision { return g.replacing(ctx, in, req, d, r) }
 	if pd.Grant != nil && d.Disposition != acs.Deny {
 		head, err := g.grant(ctx, in, req, sess, *pd.Grant)
 		switch {
 		case errors.Is(err, errGrantInvalid):
 			pd = PolicyDecision{}
-			d = g.guardianDecision(ctx, req.Method, in.SessionID, in.RequestID, denial(disposition.ReasonGrantInvalid, err.Error()))
+			d = replacing(denial(disposition.ReasonGrantInvalid, err.Error()))
 		case err != nil:
-			return g.storeFailed(ctx, in, "store append intent extension", err, sess.Head)
+			return g.answerStep(ctx, in, replacing(g.storeFailure(ctx, in, "store append intent extension", err)), sess.Head)
 		default:
 			sess.Head = head
 			chainHash = head
@@ -262,13 +280,42 @@ func (g *Guardian) step(ctx context.Context, in *call, req acs.Request) (r reply
 	}
 	switch err := g.conclude(ctx, in, req, pd, d, sess.Head); {
 	case errors.Is(err, ErrHeadMoved):
-		return g.answerStep(ctx, in, denial(disposition.ReasonSessionContended, "another writer extended the session while this step held its lock"), sess.Head)
+		return g.answerStep(ctx, in, replacing(denial(disposition.ReasonSessionContended, "another writer extended the session while this step held its lock")), sess.Head)
 	case errors.Is(err, ErrStoreFull):
-		return g.answerStep(ctx, in, denial(disposition.ReasonStoreFull, "the Guardian holds as many approved skills as it keeps"), sess.Head)
+		return g.answerStep(ctx, in, replacing(denial(disposition.ReasonStoreFull, "the Guardian holds as many approved skills as it keeps")), sess.Head)
 	case err != nil:
-		return g.storeFailed(ctx, in, "store conclude", err, sess.Head)
+		return g.answerStep(ctx, in, replacing(g.storeFailure(ctx, in, "store conclude", err)), sess.Head)
 	}
 	return g.answerStep(ctx, in, d, sess.Head)
+}
+
+// replacing returns r, an answer that replaces the step's decision d, as a
+// Guardian decision with what keeping keeps of d.
+func (g *Guardian) replacing(ctx context.Context, in *call, req acs.Request, d, r acs.Decision) acs.Decision {
+	return g.guardianDecision(ctx, req.Method, in.SessionID, in.RequestID, keeping(d, r))
+}
+
+// keeping returns r, an answer that replaces the decision d, with the reason
+// codes and reasoning §6.5 and §9.2 require of d, and audit_unavailable,
+// kept in it.
+func keeping(d, r acs.Decision) acs.Decision {
+	if kept := requiredCodes(d); len(kept) > 0 {
+		r.ReasonCodes = append(kept, r.ReasonCodes...)
+		r.Reasoning += ". " + d.Reasoning
+	}
+	return r
+}
+
+// requiredCodes returns the reason codes of d that record a §6.5 or §9.2
+// substitution, or that its required audit event was not written.
+func requiredCodes(d acs.Decision) []string {
+	var codes []string
+	for _, c := range d.ReasonCodes {
+		if c == disposition.ReasonModifyUnsupported || c == disposition.ReasonApproverUnavailable || c == disposition.ReasonAuditUnavailable {
+			codes = append(codes, c)
+		}
+	}
+	return codes
 }
 
 func (g *Guardian) reserveRejected(ctx context.Context, in *call, req acs.Request, rejected reply) reply {
@@ -287,16 +334,21 @@ func (g *Guardian) reserveRejected(ctx context.Context, in *call, req acs.Reques
 // storeFailed answers an authenticated step the store failed: the detail is
 // recorded, and the Observed Agent receives a signed DENY.
 func (g *Guardian) storeFailed(ctx context.Context, in *call, what string, err error, chainHash ...string) reply {
-	g.failure(ctx, in.Method, in.SessionID, in.RequestID, what, err)
-	reason, message := disposition.ReasonStoreUnavailable, "the Guardian's session store failed"
-	if g.stop.Err() != nil {
-		reason, message = disposition.ReasonShuttingDown, "the Guardian stopped before it could decide"
-	}
 	head := ""
 	if len(chainHash) > 0 {
 		head = chainHash[0]
 	}
-	return g.answerStep(ctx, in, g.guardianDecision(ctx, in.Method, in.SessionID, in.RequestID, denial(reason, message)), head)
+	return g.answerStep(ctx, in, g.guardianDecision(ctx, in.Method, in.SessionID, in.RequestID, g.storeFailure(ctx, in, what, err)), head)
+}
+
+// storeFailure records what the store reported and returns the DENY that
+// answers it.
+func (g *Guardian) storeFailure(ctx context.Context, in *call, what string, err error) acs.Decision {
+	g.failure(ctx, in.Method, in.SessionID, in.RequestID, what, err)
+	if g.stop.Err() != nil {
+		return denial(disposition.ReasonShuttingDown, "the Guardian stopped before it could decide")
+	}
+	return denial(disposition.ReasonStoreUnavailable, "the Guardian's session store failed")
 }
 
 // checkPayload validates the payload: a native hook against its schema, a
@@ -434,20 +486,20 @@ func chainMismatch(req acs.Request, head string) bool {
 // names no toolCallRequest among entries, the session's entries before this
 // step (hooks.md). A store that archives entries holds fewer, and a
 // reference to an archived request is recorded too.
-func (g *Guardian) recordUnresolvedReference(ctx context.Context, in *call, req acs.Request, entries []acs.ContextEntry) {
+func (g *Guardian) recordUnresolvedReference(ctx context.Context, in *call, req acs.Request, entries []acs.ContextEntry) error {
 	if req.Method != acs.StepToolCallResult {
-		return
+		return nil
 	}
 	var p acs.ToolCallResultPayload
 	if jsonv2.Unmarshal(req.Params.Payload, &p) != nil || p.RequestIDRef == nil {
-		return
+		return nil
 	}
 	for _, e := range entries {
 		if e.StepType == acs.StepToolCallRequest && e.StepID == *p.RequestIDRef {
-			return
+			return nil
 		}
 	}
-	g.event(ctx, EventRequestIDRefUnresolved, req.Method, in.SessionID, in.RequestID,
+	return g.requiredEvent(ctx, EventRequestIDRefUnresolved, req.Method, in.SessionID, in.RequestID,
 		fmt.Sprintf("request_id_ref %q names no toolCallRequest this Guardian holds for the session", *p.RequestIDRef))
 }
 
@@ -505,7 +557,8 @@ func (g *Guardian) decide(ctx context.Context, in *call, req acs.Request, sess S
 		g.failure(ctx, req.Method, in.SessionID, in.RequestID, "policy input", err)
 		return PolicyDecision{Decision: denial(disposition.ReasonEvaluationFailed, "the Guardian could not isolate the policy input")}
 	}
-	pd, err := g.callEngine(ctx, negotiatedTimeout(sess.Handshake.Server, req.Method), input)
+	decided, _ := g.deadlines(in, sess.Handshake.Server, req.Method)
+	pd, err := g.callEngine(ctx, decided, input)
 	switch {
 	case errors.Is(err, errEngineSaturated):
 		g.failure(ctx, req.Method, in.SessionID, in.RequestID, "policy engine", err)
@@ -543,11 +596,14 @@ func (g *Guardian) substitute(ctx context.Context, in *call, req acs.Request, se
 	d := pd.Decision
 	switch {
 	case d.Disposition == acs.Modify && pd.Client.CannotApplyModify:
-		g.event(ctx, EventModifyUnsupported, req.Method, in.SessionID, in.RequestID, "modification not delivered: "+d.Reasoning)
+		substituted := disposition.ModifyUnsupported(d)
 		if req.Method == acs.StepPostCompact {
-			return disposition.ModifyUnsupportedAtPostCompact(d)
+			substituted = disposition.ModifyUnsupportedAtPostCompact(d)
 		}
-		return disposition.ModifyUnsupported(d)
+		if err := g.requiredEvent(ctx, EventModifyUnsupported, req.Method, in.SessionID, in.RequestID, substituted.Reasoning); err != nil {
+			return g.auditUnavailable(ctx, in, req, err, substituted)
+		}
+		return substituted
 	case d.Disposition == acs.Ask:
 		substitution := g.cfg.AskSubstitution
 		if substitution == AskSubstitutionNone && pd.Client.CannotResolveAsk {
@@ -561,13 +617,33 @@ func (g *Guardian) substitute(ctx context.Context, in *call, req acs.Request, se
 			if substitution == AskSubstitutionDefer {
 				replacement = disposition.AskAsDefer(d)
 			}
-			g.event(ctx, EventAskSubstituted, req.Method, in.SessionID, in.RequestID, fmt.Sprintf("ask answered %s for a client that cannot route an approval", replacement.Disposition))
+			if err := g.requiredEvent(ctx, EventAskSubstituted, req.Method, in.SessionID, in.RequestID, fmt.Sprintf("ask answered %s for a client that cannot route an approval", replacement.Disposition)); err != nil {
+				return g.auditUnavailable(ctx, in, req, err, replacement)
+			}
 			d = replacement
 		}
 	}
 	if d.Disposition == acs.Defer && sess.Deferrals+1 > g.cfg.MaxDeferrals {
-		return denial(disposition.ReasonDeferralBoundExceeded, fmt.Sprintf("the session has deferred %d times, the most this Guardian allows (§6)", sess.Deferrals))
+		return keeping(d, denial(disposition.ReasonDeferralBoundExceeded, fmt.Sprintf("the session has deferred %d times, the most this Guardian allows (§6)", sess.Deferrals)))
 	}
+	return d
+}
+
+// auditUnavailable answers a step whose required audit event could not be
+// written: DENY rather than a decision the record does not show, keeping the
+// substituted decision's reason codes and reasoning, which §6.5 and §9.2
+// require of the answer. Where the substitute is ALLOW, at postCompact, it
+// stands, since §6.5 permits no DENY there.
+func (g *Guardian) auditUnavailable(ctx context.Context, in *call, req acs.Request, err error, substituted acs.Decision) acs.Decision {
+	g.failure(ctx, req.Method, in.SessionID, in.RequestID, "required audit event", err)
+	d := substituted
+	if d.Disposition != acs.Allow {
+		d = denial(disposition.ReasonAuditUnavailable, strings.TrimSpace("The Guardian could not record the audit event this decision requires. "+substituted.Reasoning))
+		if substituted.PolicyReferences != nil {
+			d.PolicyReferences = substituted.PolicyReferences
+		}
+	}
+	d.ReasonCodes = append(slices.Clip(substituted.ReasonCodes), disposition.ReasonAuditUnavailable)
 	return d
 }
 
@@ -595,20 +671,23 @@ func (g *Guardian) conclude(ctx context.Context, in *call, req acs.Request, pd P
 
 var errEngineSaturated = errors.New("every engine call place is taken")
 
-// callEngine runs the engine under the decision timeout and ctx, which
+// callEngine runs the engine until deadline and under ctx, which
 // Shutdown cancels, and turns a panic into an error. It stops waiting when
 // ctx ends even if the engine does not, so an engine that ignores
 // cancellation cannot hold the answer; the call keeps its place in
 // engineCalls until the engine returns, and gives it back before its
 // outcome is delivered, so the step that answer lets a client send next
 // never finds that place still taken.
-func (g *Guardian) callEngine(ctx context.Context, timeout time.Duration, in PolicyInput) (PolicyDecision, error) {
+func (g *Guardian) callEngine(ctx context.Context, deadline time.Time, in PolicyInput) (PolicyDecision, error) {
+	if !time.Now().Before(deadline) {
+		return PolicyDecision{}, context.DeadlineExceeded
+	}
 	select {
 	case g.engineCalls <- struct{}{}:
 	default:
 		return PolicyDecision{}, errEngineSaturated
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	type outcome struct {
 		pd  PolicyDecision
@@ -713,6 +792,40 @@ func (g *Guardian) grant(ctx context.Context, in *call, req acs.Request, sess Se
 		return "", err
 	}
 	return entry.EntryHash, nil
+}
+
+// deadlines returns when a step's decision and its recording end, counted
+// from arrival: the negotiated timeout less the answer margin, then less half
+// of it, which signing and sending keep. The margin scales with the
+// negotiated timeout, for a session negotiated under another DecisionTimeout.
+func (g *Guardian) deadlines(in *call, server acs.ServerHello, methodName string) (decided, recorded time.Time) {
+	timeout := negotiatedTimeout(server, methodName)
+	margin := time.Duration(float64(g.cfg.AnswerMargin) * float64(timeout) / float64(g.cfg.DecisionTimeout))
+	return in.ArrivedAt.Add(timeout - margin), in.ArrivedAt.Add(timeout - margin/2)
+}
+
+// lock waits for the session's lock until deadline. The deadline bounds only
+// the wait, since lockCtx derives from the context Lock receives: lockCtx
+// ends when ctx ends or the store loses the lock, and each later phase of the
+// step sets its own deadline on it.
+func (g *Guardian) lock(ctx context.Context, sessionID string, deadline time.Time) (context.Context, func(), error) {
+	wait, stopWaiting := context.WithCancelCause(ctx)
+	timer := time.AfterFunc(time.Until(deadline), func() { stopWaiting(context.DeadlineExceeded) })
+	lockCtx, release, err := g.cfg.Store.Lock(wait, sessionID)
+	if !timer.Stop() {
+		if err == nil {
+			release()
+		}
+		err = context.DeadlineExceeded
+	}
+	if err != nil {
+		stopWaiting(nil)
+		return nil, nil, err
+	}
+	return lockCtx, func() {
+		release()
+		stopWaiting(nil)
+	}, nil
 }
 
 func negotiatedTimeout(server acs.ServerHello, methodName string) time.Duration {

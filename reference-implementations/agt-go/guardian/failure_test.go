@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -49,6 +50,9 @@ type panickingAuditLog struct{}
 
 func (panickingAuditLog) Envelope(context.Context, guardian.EnvelopeRecord) { panic("envelope") }
 func (panickingAuditLog) Event(context.Context, guardian.AuditEvent)        { panic("event") }
+func (panickingAuditLog) RequiredEvent(context.Context, guardian.AuditEvent) error {
+	panic("required event")
+}
 
 func (s *panickingStore) Load(ctx context.Context, sessionID string) (guardian.Session, bool, error) {
 	if s.panicOnLoad {
@@ -563,6 +567,362 @@ func TestEngineCallsAreBounded(t *testing.T) {
 		if !slices.Contains(r.ReasonCodes, disposition.ReasonEngineSaturated) || time.Now().After(deadline) {
 			t.Fatalf("a step after the abandoned call returned got %+v", r)
 		}
+	}
+}
+
+// TestDenialArrivesBeforeTheDeclaredTimeout: an engine that never answers
+// still gets the agent a signed DENY before the declared timeout_config.
+func TestDenialArrivesBeforeTheDeclaredTimeout(t *testing.T) {
+	const declared = 300 * time.Millisecond
+	h := newHarness(t, func(c *guardian.Config) { c.DecisionTimeout = declared; c.AnswerMargin = 100 * time.Millisecond })
+	c := h.session()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		<-release
+		return guardian.PolicyDecision{Decision: acs.Decision{Disposition: acs.Allow}}, nil
+	})
+	start := time.Now()
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed := time.Since(start); elapsed >= declared {
+		t.Fatalf("the answer took %s, the declared timeout is %s", elapsed, declared)
+	}
+	if r.Disposition != acs.Deny || !slices.Contains(r.ReasonCodes, disposition.ReasonEvaluationFailed) {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// slowStore wraps the memory store; while slow is set, Load waits up to a
+// second for its context, as a store that cannot be reached does, and while
+// slowAppend or slowConclude is set, Append or Conclude does, and a stalled
+// Conclude closes concluding when it is set. While loseLockAfter is set, the
+// store loses the session's lock that long after granting it. Conclude
+// panics when concludePanics is set and returns concludeErr when it is set.
+type slowStore struct {
+	*guardian.MemorySessionContextStore
+	slow, slowAppend, slowConclude atomic.Bool
+	loseLockAfter                  atomic.Int64
+	concluding                     chan struct{}
+	concludeErr                    error
+	concludePanics                 bool
+	// holdAppend, when set, holds every Append, whatever its context, until
+	// it is closed; appending is closed when the first Append starts.
+	holdAppend, appending chan struct{}
+	appendOnce            sync.Once
+}
+
+func (s *slowStore) Lock(ctx context.Context, sessionID string) (context.Context, func(), error) {
+	lockCtx, release, err := s.MemorySessionContextStore.Lock(ctx, sessionID)
+	after := time.Duration(s.loseLockAfter.Load())
+	if err != nil || after == 0 {
+		return lockCtx, release, err
+	}
+	lockCtx, lose := context.WithCancelCause(lockCtx)
+	time.AfterFunc(after, func() { lose(guardian.ErrSessionLockLost) })
+	return lockCtx, func() { lose(nil); release() }, nil
+}
+
+func (s *slowStore) Conclude(ctx context.Context, sessionID string, c guardian.Conclusion) error {
+	if s.concludePanics {
+		panic("the store failed")
+	}
+	if s.concludeErr != nil {
+		return s.concludeErr
+	}
+	if s.slowConclude.Load() && s.concluding != nil {
+		close(s.concluding)
+	}
+	if err := stall(ctx, &s.slowConclude); err != nil {
+		return err
+	}
+	return s.MemorySessionContextStore.Conclude(ctx, sessionID, c)
+}
+
+func (s *slowStore) Append(ctx context.Context, sessionID string, a guardian.Append) error {
+	if s.holdAppend != nil {
+		s.appendOnce.Do(func() { close(s.appending) })
+		<-s.holdAppend
+	}
+	if err := stall(ctx, &s.slowAppend); err != nil {
+		return err
+	}
+	return s.MemorySessionContextStore.Append(ctx, sessionID, a)
+}
+
+func (s *slowStore) Load(ctx context.Context, sessionID string) (guardian.Session, bool, error) {
+	if err := stall(ctx, &s.slow); err != nil {
+		return guardian.Session{}, false, err
+	}
+	return s.MemorySessionContextStore.Load(ctx, sessionID)
+}
+
+// stall waits up to a second for ctx while on is set, and fails either way.
+func stall(ctx context.Context, on *atomic.Bool) error {
+	if !on.Load() {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Second):
+		return errors.New("the store did not answer")
+	}
+}
+
+// TestSlowStoreAnswersBeforeTheDeclaredTimeout: the deadline covers the
+// whole step, not only the engine call, so a store that stops answering
+// still gets the agent a signed DENY before the declared timeout_config.
+func TestSlowStoreAnswersBeforeTheDeclaredTimeout(t *testing.T) {
+	const declared = 300 * time.Millisecond
+	var store *slowStore
+	h := newHarness(t, func(c *guardian.Config) {
+		store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore)}
+		c.Store, c.DecisionTimeout, c.AnswerMargin = store, declared, 100*time.Millisecond
+	})
+	c := h.session()
+	store.slow.Store(true)
+	start := time.Now()
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed := time.Since(start); elapsed >= declared {
+		t.Fatalf("the answer took %s, the declared timeout is %s", elapsed, declared)
+	}
+	if r.Disposition != acs.Deny || !slices.Contains(r.ReasonCodes, disposition.ReasonStoreUnavailable) {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// TestRecoveredSessionAnswersInItsOwnTime: a session negotiated under a
+// shorter decision timeout than the Guardian now serving it gets its answer
+// within its own timeout when the store stalls on its step. The serving
+// Guardian's margin, scaled to the session, leaves it 100ms to answer.
+func TestRecoveredSessionAnswersInItsOwnTime(t *testing.T) {
+	const negotiated = 200 * time.Millisecond
+	first := newHarness(t, func(c *guardian.Config) { c.DecisionTimeout = negotiated })
+	c := first.session()
+	store := &slowStore{MemorySessionContextStore: first.store}
+	second := newHarness(t, func(c *guardian.Config) {
+		c.Store, c.DecisionTimeout, c.AnswerMargin = store, 2*time.Second, time.Second
+	})
+	c.Transport = second.post
+	store.slowAppend.Store(true)
+	start := time.Now()
+	second.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed := time.Since(start); elapsed >= negotiated {
+		t.Fatalf("the answer took %s, the session negotiated %s", elapsed, negotiated)
+	}
+}
+
+// TestLockWaitAnswersBeforeTheDeclaredTimeout: a step that waits for its
+// session's lock past this Guardian's deadline is answered DENY in time.
+func TestLockWaitAnswersBeforeTheDeclaredTimeout(t *testing.T) {
+	const declared = 600 * time.Millisecond
+	var store *slowStore
+	h := newHarness(t, func(c *guardian.Config) {
+		store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore)}
+		c.Store, c.DecisionTimeout, c.AnswerMargin = store, declared, 200*time.Millisecond
+	})
+	c := h.session()
+	store.holdAppend, store.appending = make(chan struct{}), make(chan struct{})
+	held := make(chan *acs.Result, 1)
+	go func() { held <- h.decision(c, acs.StepToolCallRequest, toolCall("ls")) }()
+	<-store.appending
+	start := time.Now()
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed := time.Since(start); elapsed >= declared {
+		t.Fatalf("the answer took %s, the declared timeout is %s", elapsed, declared)
+	}
+	if r.Disposition != acs.Deny || !slices.Contains(r.ReasonCodes, disposition.ReasonStoreUnavailable) {
+		t.Fatalf("got %+v", r)
+	}
+	close(store.holdAppend)
+	<-held
+}
+
+// TestRecoveredSessionKeepsItsLongerTimeout: a session negotiated under a
+// longer decision timeout than the Guardian now serving it keeps its own
+// time for the decision.
+func TestRecoveredSessionKeepsItsLongerTimeout(t *testing.T) {
+	first := newHarness(t, func(c *guardian.Config) { c.DecisionTimeout = time.Second })
+	c := first.session()
+	second := newHarness(t, func(c *guardian.Config) { c.Store, c.DecisionTimeout = first.store, 200*time.Millisecond })
+	c.Transport = second.post
+	second.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		time.Sleep(350 * time.Millisecond)
+		return guardian.PolicyDecision{Decision: acs.Decision{Disposition: acs.Allow}}, nil
+	})
+	if r := second.decision(c, acs.StepToolCallRequest, toolCall("ls")); r.Disposition != acs.Allow {
+		t.Fatalf("a decision within the session's 1s got %+v", r)
+	}
+}
+
+// TestSlowRecordingAnswersInTime: a decision that ends just before its
+// deadline and a store that stalls while recording it still get the agent an
+// answer half the answer margin before the declared timeout_config, which
+// signing and sending keep.
+func TestSlowRecordingAnswersInTime(t *testing.T) {
+	const declared, margin = 2 * time.Second, time.Second
+	var store *slowStore
+	h := newHarness(t, func(c *guardian.Config) {
+		store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore)}
+		c.Store, c.DecisionTimeout, c.AnswerMargin = store, declared, margin
+	})
+	c := h.session()
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		time.Sleep(declared - margin - 200*time.Millisecond)
+		return guardian.PolicyDecision{Decision: acs.Decision{Disposition: acs.Allow}, State: json.RawMessage(`{}`)}, nil
+	})
+	store.slowConclude.Store(true)
+	start := time.Now()
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed, bound := time.Since(start), declared-margin/4; elapsed >= bound {
+		t.Fatalf("the answer took %s, past %s", elapsed, bound)
+	}
+	if !slices.Contains(r.ReasonCodes, disposition.ReasonStoreUnavailable) {
+		t.Fatalf("got %+v; a decision past its deadline never reaches recording", r)
+	}
+}
+
+// lateRecording is a harness whose decisions end 200ms before their 1s
+// deadline and whose store stalls recording them, until the recording
+// deadline at 1.5s unless something stops it sooner.
+func lateRecording(t *testing.T) (*harness, *slowStore, *observedagent.Client) {
+	var store *slowStore
+	h := newHarness(t, func(c *guardian.Config) {
+		store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore), concluding: make(chan struct{})}
+		c.Store, c.DecisionTimeout, c.AnswerMargin = store, 2*time.Second, time.Second
+	})
+	c := h.session()
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		time.Sleep(800 * time.Millisecond)
+		return guardian.PolicyDecision{Decision: acs.Decision{Disposition: acs.Allow}, State: json.RawMessage(`{}`)}, nil
+	})
+	store.slowConclude.Store(true)
+	return h, store, c
+}
+
+// TestLostLockStopsRecording: recording a decision runs past the decision's
+// deadline, but not past the store's loss of the session's lock, even when
+// the lock is lost after that deadline.
+func TestLostLockStopsRecording(t *testing.T) {
+	h, store, c := lateRecording(t)
+	store.loseLockAfter.Store(int64(1100 * time.Millisecond))
+	start := time.Now()
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed := time.Since(start); elapsed >= 1350*time.Millisecond {
+		t.Fatalf("the answer took %s; the lock was lost at 1.1s", elapsed)
+	}
+	if r.Disposition != acs.Deny || !slices.Contains(r.ReasonCodes, disposition.ReasonStoreUnavailable) {
+		t.Fatalf("got %+v; a decision past its deadline never reaches recording", r)
+	}
+}
+
+// TestShutdownStopsRecording: recording a decision runs past the decision's
+// deadline, but not past Shutdown's cancellation after that deadline.
+func TestShutdownStopsRecording(t *testing.T) {
+	h, store, c := lateRecording(t)
+	start := time.Now()
+	answered := make(chan *acs.Result, 1)
+	go func() { answered <- h.decision(c, acs.StepToolCallRequest, toolCall("ls")) }()
+	select {
+	case <-store.concluding:
+	case r := <-answered:
+		t.Fatalf("the step was answered before recording began, so the decision missed its deadline: %+v", r)
+	}
+	time.Sleep(time.Until(start.Add(1100 * time.Millisecond)))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := h.g.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	r := <-answered
+	if elapsed := time.Since(start); elapsed >= 1350*time.Millisecond {
+		t.Fatalf("the answer took %s; Shutdown cancelled the step at 1.1s", elapsed)
+	}
+	if r.Disposition != acs.Deny || !slices.Contains(r.ReasonCodes, disposition.ReasonShuttingDown) {
+		t.Fatalf("the recording step got %+v", r)
+	}
+}
+
+// TestCallerDeadlineStopsRecording: recording a decision runs past the
+// decision's deadline, but not past the deadline of the context the caller
+// passes to Handle.
+func TestCallerDeadlineStopsRecording(t *testing.T) {
+	var store *slowStore
+	h := newHarness(t, func(c *guardian.Config) {
+		store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore)}
+		c.Store = store
+	})
+	c := h.session()
+	c.Transport = func(ctx context.Context, body []byte) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		return h.g.Handle(ctx, body), nil
+	}
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		return guardian.PolicyDecision{Decision: acs.Decision{Disposition: acs.Allow}, State: json.RawMessage(`{}`)}, nil
+	})
+	store.slowConclude.Store(true)
+	start := time.Now()
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatalf("the answer took %s after the caller's deadline", elapsed)
+	}
+	if r.Disposition != acs.Deny {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// TestStoreFailureKeepsTheSubstitutionCode: a store that fails to keep a
+// substituted decision's state answers DENY with the substitution's reason
+// code still in it (§6.5).
+func TestStoreFailureKeepsTheSubstitutionCode(t *testing.T) {
+	h := newHarness(t, func(c *guardian.Config) {
+		c.Store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore), concludeErr: errors.New("disk failed")}
+	})
+	c := h.session()
+	modify := acs.Decision{Disposition: acs.Modify, Reasoning: "rewrite", Modifications: &acs.Modifications{Redactions: []acs.Redaction{{Path: "/command"}}}}
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		return guardian.PolicyDecision{Decision: modify, Client: guardian.ClientCapability{CannotApplyModify: true}, State: json.RawMessage(`{}`)}, nil
+	})
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if r.Disposition != acs.Deny || !slices.Equal(r.ReasonCodes, []string{disposition.ReasonModifyUnsupported, disposition.ReasonStoreUnavailable}) || !strings.Contains(r.Reasoning, "redact /command") {
+		t.Fatalf("got %+v; §6.5 keeps the code and the reasoning that names the modification", r)
+	}
+}
+
+// TestStorePanicKeepsTheSubstitutionCode: a store that panics while it
+// keeps a substituted decision's state is answered with the substitution's
+// reason code and reasoning still in the answer (§6.5).
+func TestStorePanicKeepsTheSubstitutionCode(t *testing.T) {
+	h := newHarness(t, func(c *guardian.Config) {
+		c.Store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore), concludePanics: true}
+	})
+	c := h.session()
+	modify := acs.Decision{Disposition: acs.Modify, Reasoning: "rewrite", Modifications: &acs.Modifications{Redactions: []acs.Redaction{{Path: "/command"}}}}
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		return guardian.PolicyDecision{Decision: modify, Client: guardian.ClientCapability{CannotApplyModify: true}, State: json.RawMessage(`{}`)}, nil
+	})
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if r.Disposition != acs.Deny || !slices.Equal(r.ReasonCodes, []string{disposition.ReasonModifyUnsupported, disposition.ReasonEvaluationFailed}) || !strings.Contains(r.Reasoning, "redact /command") {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// TestStoreFailureKeepsAuditUnavailable: a store failure after a required
+// audit event failed keeps both the substitution code and audit_unavailable.
+func TestStoreFailureKeepsAuditUnavailable(t *testing.T) {
+	h := newHarness(t, func(c *guardian.Config) {
+		c.Store = &slowStore{MemorySessionContextStore: c.Store.(*guardian.MemorySessionContextStore), concludeErr: errors.New("disk failed")}
+		c.AuditLog = &auditRecorder{requiredFails: true}
+	})
+	c := h.session()
+	modify := acs.Decision{Disposition: acs.Modify, Reasoning: "rewrite", Modifications: &acs.Modifications{Redactions: []acs.Redaction{{Path: "/command"}}}}
+	h.engine.set(func(context.Context, guardian.PolicyInput) (guardian.PolicyDecision, error) {
+		return guardian.PolicyDecision{Decision: modify, Client: guardian.ClientCapability{CannotApplyModify: true}, State: json.RawMessage(`{}`)}, nil
+	})
+	r := h.decision(c, acs.StepToolCallRequest, toolCall("ls"))
+	if want := []string{disposition.ReasonModifyUnsupported, disposition.ReasonAuditUnavailable, disposition.ReasonStoreUnavailable}; r.Disposition != acs.Deny || !slices.Equal(r.ReasonCodes, want) || !strings.Contains(r.Reasoning, "redact /command") {
+		t.Fatalf("got %+v, want reason codes %v", r, want)
 	}
 }
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -28,20 +27,23 @@ func loadReferenceConfig(t *testing.T, overrides ...string) (config, error) {
 	}, overrides...))
 }
 
-// TestEvaluatorSelection: policy.evaluator has no default, the go evaluator
-// runs in every build, and agt runs only in a build with the agteval tag;
-// agtSelection checks the agt half for this build.
+// TestEvaluatorSelection: policy.evaluator has no default, and agt runs
+// only in a build with the agteval tag; agtSelection checks it for this
+// build.
 func TestEvaluatorSelection(t *testing.T) {
 	for name, tt := range map[string]struct {
 		overrides []string
 		want      string
 	}{
-		"missing":                          {[]string{"ACS__POLICY__EVALUATOR="}, `policy.evaluator must be "agt" or "go"`},
-		"unknown":                          {[]string{"ACS__POLICY__EVALUATOR=rego"}, `policy.evaluator must be "agt" or "go"`},
-		"agt_without_opa":                  {[]string{"ACS__POLICY__OPA_PATH="}, "policy.opa_path must name the opa executable"},
-		"agt_zero_timeout":                 {[]string{"ACS__POLICY__OPA_TIMEOUT=0s"}, "policy.opa_timeout must be positive"},
-		"agt_timeout_equal_to_decision":    {[]string{"ACS__POLICY__OPA_TIMEOUT=5s", "ACS__PROTOCOL__DECISION_TIMEOUT=5s"}, "policy.opa_timeout must be shorter than protocol.decision_timeout"},
-		"agt_timeout_longer_than_decision": {[]string{"ACS__POLICY__OPA_TIMEOUT=6s", "ACS__PROTOCOL__DECISION_TIMEOUT=5s"}, "policy.opa_timeout must be shorter than protocol.decision_timeout"},
+		"missing":                           {[]string{"ACS__POLICY__EVALUATOR="}, `policy.evaluator must be "agt"`},
+		"unknown":                           {[]string{"ACS__POLICY__EVALUATOR=rego"}, `policy.evaluator must be "agt"`},
+		"agt_without_opa":                   {[]string{"ACS__POLICY__OPA_PATH="}, "policy.opa_path must name the opa executable"},
+		"agt_zero_timeout":                  {[]string{"ACS__POLICY__OPA_TIMEOUT=0s"}, "policy.opa_timeout must be positive"},
+		"agt_timeout_equal_to_decision":     {[]string{"ACS__POLICY__OPA_TIMEOUT=5s", "ACS__PROTOCOL__DECISION_TIMEOUT=5s"}, "policy.opa_timeout must be shorter than protocol.decision_timeout"},
+		"agt_timeout_longer_than_decision":  {[]string{"ACS__POLICY__OPA_TIMEOUT=6s", "ACS__PROTOCOL__DECISION_TIMEOUT=5s"}, "policy.opa_timeout must be shorter than protocol.decision_timeout"},
+		"agt_timeout_inside_answer_margin":  {[]string{"ACS__POLICY__OPA_TIMEOUT=4600ms", "ACS__PROTOCOL__DECISION_TIMEOUT=5s", "ACS__PROTOCOL__ANSWER_MARGIN=500ms"}, "policy.opa_timeout must be shorter than protocol.decision_timeout minus protocol.answer_margin"},
+		"answer_margin_missing":             {[]string{"ACS__PROTOCOL__ANSWER_MARGIN=0s"}, "protocol.answer_margin must be positive and shorter than protocol.decision_timeout"},
+		"answer_margin_as_long_as_decision": {[]string{"ACS__PROTOCOL__ANSWER_MARGIN=5s", "ACS__PROTOCOL__DECISION_TIMEOUT=5s"}, "protocol.answer_margin must be positive and shorter than protocol.decision_timeout"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := loadReferenceConfig(t, tt.overrides...); err == nil || !strings.Contains(err.Error(), tt.want) {
@@ -49,15 +51,6 @@ func TestEvaluatorSelection(t *testing.T) {
 			}
 		})
 	}
-	t.Run("go", func(t *testing.T) {
-		c, err := loadReferenceConfig(t, "ACS__POLICY__EVALUATOR=go", "ACS__POLICY__OPA_PATH=")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := newEvaluator(context.Background(), c); err != nil {
-			t.Fatal(err)
-		}
-	})
 	t.Run("agt", func(t *testing.T) {
 		c, err := loadReferenceConfig(t)
 		if err != nil {

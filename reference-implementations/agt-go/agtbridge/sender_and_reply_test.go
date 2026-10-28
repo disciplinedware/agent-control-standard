@@ -1,3 +1,5 @@
+//go:build agteval
+
 package agtbridge_test
 
 import (
@@ -10,21 +12,18 @@ import (
 
 	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/acs"
 	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/agtbridge"
-	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/agtbridge/goeval"
+	"github.com/GenAI-Security-Project/agent-control-standard/reference-implementations/agt-go/agtbridge/agteval"
 )
 
-// deploymentEvaluators build an evaluator over a deployment directory's
-// policy/manifest.yaml, one per evaluator this build has; a build with the
-// agteval tag adds the native one (evaluators_test.go).
-var deploymentEvaluators = map[string]func(t testing.TB, dir string) agtbridge.Evaluator{
-	"go": func(t testing.TB, dir string) agtbridge.Evaluator {
-		t.Helper()
-		e, err := goeval.New(context.Background(), os.DirFS(dir), "policy/manifest.yaml")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return e
-	},
+// deploymentEvaluator builds AGT's evaluator over a deployment directory's
+// policy/manifest.yaml.
+func deploymentEvaluator(t testing.TB, dir string) agtbridge.Evaluator {
+	t.Helper()
+	e, err := agteval.New(agtConfig(dir + "/policy/manifest.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 // A deployment governing three things the stock bundle does not: a rule that
@@ -115,7 +114,7 @@ func requestWithSender(t *testing.T, method string, payload any, userID *string)
 	return req
 }
 
-func TestSenderReplyAndArgumentlessToolOnEveryEvaluator(t *testing.T) {
+func TestSenderReplyAndArgumentlessTool(t *testing.T) {
 	caller := "+15550100"
 	other := "+15550199"
 	toolCall := func(name string, args map[string]any) map[string]any {
@@ -152,27 +151,25 @@ func TestSenderReplyAndArgumentlessToolOnEveryEvaluator(t *testing.T) {
 			json.RawMessage(`{"content":[{"type":"text","value":"Pay at \u0068ttps://pay.example.net/y"}]}`), &caller, acs.Deny, "foreign_link"},
 	}
 	dir := senderAndReplyDeployment(t)
-	for evaluatorName, build := range deploymentEvaluators {
-		engine, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", build(t, dir), agtbridge.Options{})
-		if err != nil {
-			t.Fatalf("%s: %v", evaluatorName, err)
-		}
-		for _, tc := range cases {
-			t.Run(evaluatorName+"/"+tc.name, func(t *testing.T) {
-				in := input(t, tc.method, tc.payload)
-				in.Request = requestWithSender(t, tc.method, tc.payload, tc.userID)
-				d, err := engine.Decide(context.Background(), in)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if d.Disposition != tc.want {
-					t.Fatalf("got %+v", d.Decision)
-				}
-				if tc.reason != "" && (len(d.ReasonCodes) == 0 || d.ReasonCodes[0] != tc.reason) {
-					t.Fatalf("reason codes %v, want %s", d.ReasonCodes, tc.reason)
-				}
-			})
-		}
+	engine, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", deploymentEvaluator(t, dir), agtbridge.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := input(t, tc.method, tc.payload)
+			in.Request = requestWithSender(t, tc.method, tc.payload, tc.userID)
+			d, err := engine.Decide(context.Background(), in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Disposition != tc.want {
+				t.Fatalf("got %+v", d.Decision)
+			}
+			if tc.reason != "" && (len(d.ReasonCodes) == 0 || d.ReasonCodes[0] != tc.reason) {
+				t.Fatalf("reason codes %v, want %s", d.ReasonCodes, tc.reason)
+			}
+		})
 	}
 }
 
@@ -194,7 +191,7 @@ func TestAToolWithoutANamedTargetIsRefused(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			mustWrite(t, dir, "mapping.yaml", string(stock[:start])+table+tableTail(t, string(stock), start, end))
-			e, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", goEvaluator(t), agtbridge.Options{})
+			e, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", agtEvaluator(t), agtbridge.Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -219,22 +216,18 @@ func TestADefaultOfNullNamesNoArgumentForAnyTool(t *testing.T) {
 	end := strings.Index(string(stock), "  post_tool_call:\n")
 	table := "    policy_target_argument:\n      default: null\n      by_tool:\n        lookup: subject_id\n"
 	mustWrite(t, dir, "mapping.yaml", string(stock[:start])+table+tableTail(t, string(stock), start, end))
-	for evaluatorName, build := range deploymentEvaluators {
-		engine, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", build(t, dir), agtbridge.Options{})
-		if err != nil {
-			t.Fatalf("%s: %v", evaluatorName, err)
-		}
-		t.Run(evaluatorName, func(t *testing.T) {
-			list := input(t, acs.StepToolCallRequest, map[string]any{"tool": map[string]any{"name": "list_all"}, "arguments": map[string]any{}})
-			if d, err := engine.Decide(context.Background(), list); err != nil || d.Disposition != acs.Allow {
-				t.Fatalf("a tool under default null: %+v, %v", d.Decision, err)
-			}
-			// The override still names lookup's argument, which this call lacks.
-			lookup := input(t, acs.StepToolCallRequest, map[string]any{"tool": map[string]any{"name": "lookup"}, "arguments": map[string]any{}})
-			if d, err := engine.Decide(context.Background(), lookup); err == nil {
-				t.Fatalf("a by_tool override was ignored: %+v", d.Decision)
-			}
-		})
+	engine, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", deploymentEvaluator(t, dir), agtbridge.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := input(t, acs.StepToolCallRequest, map[string]any{"tool": map[string]any{"name": "list_all"}, "arguments": map[string]any{}})
+	if d, err := engine.Decide(context.Background(), list); err != nil || d.Disposition != acs.Allow {
+		t.Fatalf("a tool under default null: %+v, %v", d.Decision, err)
+	}
+	// The override still names lookup's argument, which this call lacks.
+	lookup := input(t, acs.StepToolCallRequest, map[string]any{"tool": map[string]any{"name": "lookup"}, "arguments": map[string]any{}})
+	if d, err := engine.Decide(context.Background(), lookup); err == nil {
+		t.Fatalf("a by_tool override was ignored: %+v", d.Decision)
 	}
 }
 
@@ -277,7 +270,7 @@ func TestAnEmptyPolicyTargetArgumentIsRefusedAtLoad(t *testing.T) {
 	}
 	dir := t.TempDir()
 	mustWrite(t, dir, "mapping.yaml", strings.Replace(string(stock), "        WebFetch: url\n", "        WebFetch: \"\"\n", 1))
-	if _, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", goEvaluator(t), agtbridge.Options{}); err == nil {
+	if _, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", agtEvaluator(t), agtbridge.Options{}); err == nil {
 		t.Fatal("a by_tool entry naming an empty argument was accepted")
 	}
 }

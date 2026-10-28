@@ -1,3 +1,5 @@
+//go:build agteval
+
 package agtbridge_test
 
 import (
@@ -11,7 +13,7 @@ import (
 
 // A host that sends the session, activation and turn steps must not have its
 // runs blocked by a Guardian whose mapping routes none of them to a policy:
-// a step the mapping does not cover is allowed, on every evaluator, for the
+// a step the mapping does not cover is allowed, for the
 // stock deployment and for one with its own manifest.
 func TestStepsTheMappingDoesNotCoverAreAllowed(t *testing.T) {
 	steps := map[string]any{
@@ -26,22 +28,20 @@ func TestStepsTheMappingDoesNotCoverAreAllowed(t *testing.T) {
 	}
 	deployments := map[string]string{"stock": agtTree, "own_manifest": senderAndReplyDeployment(t)}
 	for deploymentName, dir := range deployments {
-		for evaluatorName, build := range deploymentEvaluators {
-			engine, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", build(t, dir), agtbridge.Options{})
-			if err != nil {
-				t.Fatalf("%s/%s: %v", deploymentName, evaluatorName, err)
-			}
-			for method, payload := range steps {
-				t.Run(deploymentName+"/"+evaluatorName+"/"+method, func(t *testing.T) {
-					d, err := engine.Decide(context.Background(), input(t, method, payload))
-					if err != nil {
-						t.Fatal(err)
-					}
-					if d.Disposition != acs.Allow {
-						t.Fatalf("got %+v", d.Decision)
-					}
-				})
-			}
+		engine, err := agtbridge.New(os.DirFS(dir), "mapping.yaml", deploymentEvaluator(t, dir), agtbridge.Options{})
+		if err != nil {
+			t.Fatalf("%s: %v", deploymentName, err)
+		}
+		for method, payload := range steps {
+			t.Run(deploymentName+"/"+method, func(t *testing.T) {
+				d, err := engine.Decide(context.Background(), input(t, method, payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if d.Disposition != acs.Allow {
+					t.Fatalf("got %+v", d.Decision)
+				}
+			})
 		}
 	}
 }

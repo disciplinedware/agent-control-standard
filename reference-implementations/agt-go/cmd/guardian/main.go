@@ -1,7 +1,7 @@
 // Command guardian serves the ACS Guardian with AGT as its policy engine,
 // over HTTP: POST /acs, GET /healthz and GET /readyz. policy.evaluator
 // selects the AGT evaluator, which calls AGT's runtime library and needs
-// the agteval build tag, or the Go evaluator.
+// the agteval build tag.
 package main
 
 import (
@@ -51,22 +51,31 @@ type fileConfig struct {
 		ToolAliases     map[string]string `koanf:"tool_aliases"`
 	} `koanf:"policy"`
 	Security struct {
-		HMACKeyID      string `koanf:"hmac_key_id"`
-		HMACSecretFile string `koanf:"hmac_secret_file"`
+		HMACKeyID        string `koanf:"hmac_key_id"`
+		HMACSecretFile   string `koanf:"hmac_secret_file"`
+		HMACPreviousKeys []struct {
+			KeyID      string `koanf:"key_id"`
+			SecretFile string `koanf:"secret_file"`
+		} `koanf:"hmac_previous_keys"`
 	} `koanf:"security"`
 	Storage struct {
 		Provider string `koanf:"provider"`
 	} `koanf:"storage"`
 	Audit struct {
-		EnvelopeLog  string `koanf:"envelope_log"`
-		EventLog     string `koanf:"event_log"`
-		MaxFileBytes int64  `koanf:"max_file_bytes"`
-		MaxFiles     int    `koanf:"max_files"`
+		EnvelopeLog          string `koanf:"envelope_log"`
+		EventLog             string `koanf:"event_log"`
+		MaxEnvelopeFileBytes int64  `koanf:"max_envelope_file_bytes"`
+		MaxEnvelopeFiles     int    `koanf:"max_envelope_files"`
+		MaxEventFileBytes    int64  `koanf:"max_event_file_bytes"`
+		MaxEventFiles        int    `koanf:"max_event_files"`
+		MaxQueueRecords      int    `koanf:"max_queue_records"`
+		MaxQueueBytes        int64  `koanf:"max_queue_bytes"`
 	} `koanf:"audit"`
 	Protocol struct {
 		OnDecisionFailure string        `koanf:"on_decision_failure"`
 		MethodsEvaluated  []string      `koanf:"methods_evaluated"`
 		DecisionTimeout   time.Duration `koanf:"decision_timeout"`
+		AnswerMargin      time.Duration `koanf:"answer_margin"`
 		SkewWindow        time.Duration `koanf:"skew_window"`
 	} `koanf:"protocol"`
 	Limits struct {
@@ -89,10 +98,13 @@ type config struct {
 	evaluatedHooks    []string
 	envelopeLog       string
 	eventLog          string
-	auditRotation     guardian.JSONLRotation
+	envelopeRotation  guardian.JSONLRotation
+	eventRotation     guardian.JSONLRotation
+	auditQueue        guardian.JSONLQueue
 	storageProvider   string
 	keyID             string
 	secret            []byte
+	previousKeys      []guardian.HMACKey
 	policyDir         string
 	manifest          string
 	mapping           string
@@ -110,6 +122,7 @@ type config struct {
 	maxBodyBytes      int64
 	maxDeferrals      int
 	decisionTimeout   time.Duration
+	answerMargin      time.Duration
 	skewWindow        time.Duration
 	sessionRetention  time.Duration
 	readHeaderTimeout time.Duration
@@ -201,6 +214,18 @@ func loadConfig(args, environ []string) (config, error) {
 	if err != nil {
 		return config{}, fmt.Errorf("security.hmac_secret_file %q: %w", secretPath, err)
 	}
+	var previousKeys []guardian.HMACKey
+	for i, k := range raw.Security.HMACPreviousKeys {
+		path, err := resolvePath(base, k.SecretFile)
+		if err != nil {
+			return config{}, fmt.Errorf("security.hmac_previous_keys[%d].secret_file: %w", i, err)
+		}
+		previous, err := guardian.ReadHMACSecretFile(path)
+		if err != nil {
+			return config{}, fmt.Errorf("security.hmac_previous_keys[%d].secret_file %q: %w", i, path, err)
+		}
+		previousKeys = append(previousKeys, guardian.HMACKey{ID: k.KeyID, Secret: previous})
+	}
 	envelopeLog, err := resolvePath(base, raw.Audit.EnvelopeLog)
 	if err != nil {
 		return config{}, fmt.Errorf("audit.envelope_log: %w", err)
@@ -214,17 +239,20 @@ func loadConfig(args, environ []string) (config, error) {
 		path: absConfigPath, host: raw.Server.Host, port: raw.Server.Port,
 		posture: acs.FailurePosture(raw.Protocol.OnDecisionFailure), evaluatedHooks: raw.Protocol.MethodsEvaluated,
 		envelopeLog: envelopeLog, eventLog: eventLog,
-		auditRotation:   guardian.JSONLRotation{MaxFileBytes: raw.Audit.MaxFileBytes, MaxFiles: raw.Audit.MaxFiles},
-		storageProvider: raw.Storage.Provider,
-		keyID:           raw.Security.HMACKeyID, secret: secret,
-		policyDir: policyDir, manifest: manifest, mapping: mapping,
+		envelopeRotation: guardian.JSONLRotation{MaxFileBytes: raw.Audit.MaxEnvelopeFileBytes, MaxFiles: raw.Audit.MaxEnvelopeFiles},
+		eventRotation:    guardian.JSONLRotation{MaxFileBytes: raw.Audit.MaxEventFileBytes, MaxFiles: raw.Audit.MaxEventFiles},
+		auditQueue:       guardian.JSONLQueue{MaxQueueRecords: raw.Audit.MaxQueueRecords, MaxQueueBytes: raw.Audit.MaxQueueBytes},
+		storageProvider:  raw.Storage.Provider,
+		keyID:            raw.Security.HMACKeyID, secret: secret,
+		previousKeys: previousKeys,
+		policyDir:    policyDir, manifest: manifest, mapping: mapping,
 		evaluator: raw.Policy.Evaluator, opaPath: opaPath, opaTimeout: raw.Policy.OPATimeout,
 		askSubstitution: guardian.AskSubstitution(raw.Policy.AskSubstitution),
 		toolAliases:     raw.Policy.ToolAliases,
 		maxSessions:     raw.Limits.MaxSessions, maxEntries: raw.Limits.MaxEntries, maxReservations: raw.Limits.MaxReservations,
 		maxSkillApprovals: raw.Limits.MaxSkillApprovals, maxEngineCalls: raw.Limits.MaxEngineCalls,
 		maxStateBytes: raw.Limits.MaxPolicyStateBytes, maxBodyBytes: raw.Limits.MaxBodyBytes, maxDeferrals: raw.Limits.MaxDeferrals,
-		decisionTimeout: raw.Protocol.DecisionTimeout, skewWindow: raw.Protocol.SkewWindow,
+		decisionTimeout: raw.Protocol.DecisionTimeout, answerMargin: raw.Protocol.AnswerMargin, skewWindow: raw.Protocol.SkewWindow,
 		sessionRetention:  raw.Limits.SessionRetention,
 		readHeaderTimeout: raw.Server.ReadHeaderTimeout, readTimeout: raw.Server.ReadTimeout,
 		writeTimeout: raw.Server.WriteTimeout, idleTimeout: raw.Server.IdleTimeout, shutdownGrace: raw.Server.ShutdownGrace,
@@ -271,17 +299,35 @@ func (c config) validate() error {
 	if c.keyID == "" {
 		errs = append(errs, errors.New("security.hmac_key_id must not be empty"))
 	}
+	seen := map[string]bool{c.keyID: true}
+	for i, k := range c.previousKeys {
+		switch {
+		case k.ID == "":
+			errs = append(errs, fmt.Errorf("security.hmac_previous_keys[%d].key_id must not be empty", i))
+		case seen[k.ID]:
+			errs = append(errs, fmt.Errorf("security.hmac_previous_keys[%d].key_id %q is already used by another key", i, k.ID))
+		}
+		seen[k.ID] = true
+	}
 	if c.storageProvider != storageMemory {
 		errs = append(errs, fmt.Errorf("storage.provider must be %q, the one provider this command ships; a host that embeds the guardian package passes its own SessionContextStore", storageMemory))
 	}
-	if err := c.auditRotation.Validate(); err != nil {
-		errs = append(errs, fmt.Errorf("audit: %w", err))
+	if err := c.envelopeRotation.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("audit.max_envelope_file_bytes and audit.max_envelope_files: %w", err))
+	}
+	if err := c.eventRotation.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("audit.max_event_file_bytes and audit.max_event_files: %w", err))
+	}
+	if c.auditQueue.MaxQueueRecords <= 0 {
+		errs = append(errs, errors.New("audit.max_queue_records must be positive"))
+	}
+	if need := guardian.JSONLRecordBytes(c.maxBodyBytes); c.auditQueue.MaxQueueBytes < need {
+		errs = append(errs, fmt.Errorf("audit.max_queue_bytes must be at least %d to hold one request of limits.max_body_bytes", need))
 	}
 	if c.posture != acs.FailureProceed && c.posture != acs.FailureDeny {
 		errs = append(errs, fmt.Errorf("protocol.on_decision_failure must be %q or %q", acs.FailureProceed, acs.FailureDeny))
 	}
 	switch c.evaluator {
-	case evaluatorGo:
 	case evaluatorAGT:
 		if c.opaPath == "" {
 			errs = append(errs, errors.New("policy.opa_path must name the opa executable the agt evaluator runs"))
@@ -289,11 +335,11 @@ func (c config) validate() error {
 		if c.opaTimeout <= 0 {
 			errs = append(errs, errors.New("policy.opa_timeout must be positive for the agt evaluator"))
 		}
-		if c.opaTimeout >= c.decisionTimeout {
-			errs = append(errs, errors.New("policy.opa_timeout must be shorter than protocol.decision_timeout, or the agent stops waiting before AGT's deny for a slow opa arrives"))
+		if c.opaTimeout >= c.decisionTimeout-c.answerMargin {
+			errs = append(errs, errors.New("policy.opa_timeout must be shorter than protocol.decision_timeout minus protocol.answer_margin, or the Guardian's deadline ends the step before AGT's deny for a slow opa arrives"))
 		}
 	default:
-		errs = append(errs, fmt.Errorf("policy.evaluator must be %q or %q", evaluatorAGT, evaluatorGo))
+		errs = append(errs, fmt.Errorf("policy.evaluator must be %q", evaluatorAGT))
 	}
 	if c.askSubstitution != guardian.AskSubstitutionNone && c.askSubstitution != guardian.AskSubstitutionDeny && c.askSubstitution != guardian.AskSubstitutionDefer {
 		errs = append(errs, errors.New("policy.ask_substitution must be none, deny or defer"))
@@ -301,12 +347,18 @@ func (c config) validate() error {
 	if c.decisionTimeout <= 0 {
 		errs = append(errs, errors.New("protocol.decision_timeout must be positive"))
 	}
+	if c.answerMargin <= 0 || c.answerMargin >= c.decisionTimeout {
+		errs = append(errs, errors.New("protocol.answer_margin must be positive and shorter than protocol.decision_timeout"))
+	}
 	if c.skewWindow <= 0 {
 		errs = append(errs, errors.New("protocol.skew_window must be positive"))
 	}
 	minimumRetention := c.skewWindow + c.skewWindow
 	if minimumRetention < c.skewWindow || c.sessionRetention < minimumRetention {
 		errs = append(errs, errors.New("limits.session_retention must be at least twice protocol.skew_window"))
+	}
+	if c.readTimeout < c.decisionTimeout-c.answerMargin {
+		errs = append(errs, errors.New("server.read_timeout must be at least protocol.decision_timeout minus protocol.answer_margin, the time the Guardian gives each request body"))
 	}
 	if c.writeTimeout <= c.decisionTimeout {
 		errs = append(errs, errors.New("server.write_timeout must exceed protocol.decision_timeout, or a decision in time is cut off before it is sent"))
@@ -340,29 +392,25 @@ func (c config) validate() error {
 	return errors.Join(errs...)
 }
 
-func run(args, environ []string) error {
+func run(args, environ []string) (err error) {
 	c, err := loadConfig(args, environ)
 	if err != nil {
 		return err
 	}
-	signer, err := guardian.NewHMACSigner(guardian.HMACKey{ID: c.keyID, Secret: c.secret})
+	signer, err := guardian.NewHMACSigner(append([]guardian.HMACKey{{ID: c.keyID, Secret: c.secret}}, c.previousKeys...)...)
 	if err != nil {
 		return err
 	}
-	audit, err := guardian.NewJSONLAuditLog(c.envelopeLog, c.eventLog, c.auditRotation, func(err error) {
+	audit, err := guardian.NewJSONLAuditLog(c.envelopeLog, c.eventLog, c.envelopeRotation, c.eventRotation, c.auditQueue, func(err error) {
 		fmt.Fprintln(os.Stderr, "guardian: audit log:", err)
 	})
 	if err != nil {
 		return err
 	}
-	auditClosed := false
 	defer func() {
-		if auditClosed {
-			return
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), c.shutdownGrace)
 		defer cancel()
-		_ = audit.Close(ctx)
+		err = errors.Join(err, audit.Close(ctx))
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -381,7 +429,7 @@ func run(args, environ []string) error {
 		MaxEngineCalls: c.maxEngineCalls, MaxPolicyStateBytes: c.maxStateBytes,
 		MaxDeferrals:    c.maxDeferrals,
 		AskSubstitution: c.askSubstitution,
-		DecisionTimeout: c.decisionTimeout, SkewWindow: c.skewWindow,
+		DecisionTimeout: c.decisionTimeout, AnswerMargin: c.answerMargin, SkewWindow: c.skewWindow,
 		OnDecisionFailure: c.posture, MaxBodyBytes: c.maxBodyBytes,
 		EvaluatedHooks: c.evaluatedHooks,
 	})
@@ -414,25 +462,17 @@ func run(args, environ []string) error {
 		return err
 	case <-ctx.Done():
 	}
-	if err := shutdown(server, g, c.shutdownGrace); err != nil {
-		return err
-	}
-	auditGrace, auditCancel := context.WithTimeout(context.Background(), c.shutdownGrace)
-	err = audit.Close(auditGrace)
-	auditCancel()
-	auditClosed = true
-	if err != nil {
-		return err
-	}
-	return nil
+	return shutdown(server, g, c.shutdownGrace, c.shutdownGrace)
 }
 
-func shutdown(server *http.Server, g *guardian.Guardian, grace time.Duration) error {
+// shutdown lets decisions in flight finish within decisionGrace, then gives
+// their answers, cancellation denials included, deliveryGrace to be written.
+func shutdown(server *http.Server, g *guardian.Guardian, decisionGrace, deliveryGrace time.Duration) error {
 	serverContext, stopServer := context.WithCancel(context.Background())
 	closed := make(chan error, 1)
 	go func() { closed <- server.Shutdown(serverContext) }()
 
-	decisionContext, stopDecisions := context.WithTimeout(context.Background(), grace)
+	decisionContext, stopDecisions := context.WithTimeout(context.Background(), decisionGrace)
 	guardianErr := g.Shutdown(decisionContext)
 	stopDecisions()
 	if guardianErr != nil && !errors.Is(guardianErr, context.DeadlineExceeded) {
@@ -441,7 +481,7 @@ func shutdown(server *http.Server, g *guardian.Guardian, grace time.Duration) er
 		return guardianErr
 	}
 
-	deliveryContext, stopDelivery := context.WithTimeout(context.Background(), grace)
+	deliveryContext, stopDelivery := context.WithTimeout(context.Background(), deliveryGrace)
 	defer stopDelivery()
 	select {
 	case err := <-closed:

@@ -15,7 +15,7 @@ policy deployment, and choose limits for its workload.
 | `server.host` | Listener host or address. | Non-empty. |
 | `server.port` | Listener port or service name. `0` asks the operating system for a free port. | Non-empty. |
 | `server.read_header_timeout` | Maximum time to read HTTP headers. | Positive duration. |
-| `server.read_timeout` | Maximum time to read a complete request. | Positive duration. |
+| `server.read_timeout` | Maximum time to read a complete request. Once the headers have arrived, the Guardian sets its own deadline for the body: `protocol.decision_timeout` minus `protocol.answer_margin` from that moment, in place of this one. The headers stay bounded by `server.read_header_timeout`. | At least `protocol.decision_timeout` minus `protocol.answer_margin`. |
 | `server.write_timeout` | Maximum time to write an HTTP response. | Must exceed `protocol.decision_timeout`. |
 | `server.idle_timeout` | HTTP keep-alive idle limit. | Positive duration. |
 | `server.shutdown_grace` | Duration given to each shutdown phase: in-flight work, cancellation-answer delivery, and audit flush. | Positive duration. |
@@ -30,9 +30,9 @@ enabled only after the policy engine and Guardian are ready.
 | `policy.deployment_dir` | Root directory of one AGT policy deployment. | Existing absolute path, or relative to the configuration file. |
 | `policy.manifest` | AGT manifest within `policy.deployment_dir`. | Non-empty relative path that cannot escape the deployment directory. |
 | `policy.mapping` | ACS verdict mapping within `policy.deployment_dir`. | Same path rule as `policy.manifest`. |
-| `policy.evaluator` | `agt` uses AGT's runtime library. `go` uses the Go reproduction. | Required: `agt` or `go`. The reference YAML selects `agt`. `make build` includes AGT; `make build EVALUATOR=go` refuses `agt` at startup. |
-| `policy.opa_path` | The OPA executable or its directory. | Required for `agt`: absolute or relative to the configuration file. Directory paths select `opa` on Unix and `opa.exe` on Windows. `make agt-native` copies the host executable to `.acs/agt/bin/`. Not read by `go`. |
-| `policy.opa_timeout` | The bound AGT puts on each `opa` run; past it, AGT denies the step. | Required for `agt`: a duration such as `4s`, positive, a whole number of milliseconds, and shorter than `protocol.decision_timeout`. AGT's timer starts after `opa` starts, so leave room for process start and signing; `guardian.yaml` leaves one second. Not read by `go`. |
+| `policy.evaluator` | `agt` uses AGT's runtime library. | Required: `agt`. The reference YAML selects `agt`. A build without the `agteval` tag refuses `agt` at startup. |
+| `policy.opa_path` | The OPA executable or its directory. | Required for `agt`: absolute or relative to the configuration file. Directory paths select `opa` on Unix and `opa.exe` on Windows. `make agt-native` copies the host executable to `.acs/agt/bin/`. |
+| `policy.opa_timeout` | The bound AGT puts on each `opa` run; past it, AGT denies the step. | Required for `agt`: a duration such as `4s`, positive, a whole number of milliseconds, and shorter than `protocol.decision_timeout` minus `protocol.answer_margin`. AGT's timer starts after `opa` starts, so leave room for process start and signing; `guardian.yaml` leaves one second. |
 | `policy.ask_substitution` | Endpoint behavior when ASK cannot be completed. | `none`, `deny` or `defer`. |
 | `policy.tool_aliases` | Optional map from an Observed Agent's tool name to the manifest's tool name. | Both names must be non-empty. |
 
@@ -52,10 +52,7 @@ A tool alias changes only the policy input. The signed ACS request, the
 SessionContext chain and audit records keep the original tool name.
 
 Build selection and evaluator selection are separate. The `agteval` build tag
-includes AGT; `policy.evaluator` selects which evaluator runs.
-`ACS__POLICY__EVALUATOR=go` selects the Go evaluator in either build.
-An AGT build still links the library when the Go evaluator is selected.
-`make run EVALUATOR=go` builds without that dependency and selects the Go evaluator.
+includes AGT; `policy.evaluator` names the evaluator to run, and `agt` is the only one.
 
 The AGT build includes the library and `agt-native.json` beside the binary.
 Linux and macOS builds also embed the platform library directory under `.acs/agt/` for tests.
@@ -68,18 +65,55 @@ The Guardian refuses startup if the build record is missing or its checksum diff
 
 | Key | Meaning | Constraint |
 | --- | --- | --- |
-| `security.hmac_key_id` | The `key_id` the deployment gives its secret (§10): an opaque label, such as `2026-10`. A request signed under any other `key_id` is refused with `SIGNATURE_INVALID`. | Non-empty; no default. |
+| `security.hmac_key_id` | The `key_id` the deployment gives its secret (§10): an opaque label, such as `2026-10`. A request signed under a `key_id` this Guardian is not configured with is refused with `SIGNATURE_INVALID`. | Non-empty; no default. |
 | `security.hmac_secret_file` | File holding the shared HMAC secret, the HKDF input keying material. | Absolute path, or relative to the configuration file; standard base64 that decodes to at least 32 bytes, surrounding whitespace ignored; protect with operating-system permissions. |
+| `security.hmac_previous_keys` | Secrets being replaced, each a `key_id` and a `secret_file`. A request signed under one of them is verified and answered under it, beside `security.hmac_key_id`. | Optional list, set in the configuration file. Each `key_id` is non-empty and differs from every other; each `secret_file` follows the `security.hmac_secret_file` rules. |
 | `audit.envelope_log` | JSONL file for inbound and outbound ACS envelopes. | Absolute path, or relative to the configuration file. A symbolic link at the path is refused. On Unix, a file that group or other can access is refused; the Guardian does not change its mode. A missing directory is created with mode `0700`. |
 | `audit.event_log` | JSONL file for Guardian audit events. | Absolute path, or relative to the configuration file. A symbolic link at the path is refused. On Unix, a file that group or other can access is refused; the Guardian does not change its mode. A missing directory is created with mode `0700`. |
-| `audit.max_file_bytes` | Size at which each audit file rotates: it becomes `<file>.1`, older ones move up. `0` keeps every record, for a deployment that rotates the files with its own tooling. | Zero or positive. `guardian.yaml` ships 268435456 (256 MiB). |
-| `audit.max_files` | Rotated files kept per audit file; the one past it is deleted. A log keeps at most `max_file_bytes × (max_files + 1)` bytes, plus one record larger than `max_file_bytes`. | Zero or positive; needs `max_file_bytes`, which in turn needs at least 1, so a rotation never deletes the live log. `guardian.yaml` ships 3, so at most 1 GiB per log. |
+| `audit.max_envelope_file_bytes` | Size at which the envelope log is renamed to `<file>.1`, older ones moving up. `0` keeps every record in one file, for a deployment that rotates it with its own tooling. | Zero or positive. `guardian.yaml` ships 268435456 (256 MiB). |
+| `audit.max_envelope_files` | Renamed envelope log files kept; the one past it is deleted. Each file holds at most `max_envelope_file_bytes`, or one record larger than that, so the envelope log keeps at most `max_envelope_file_bytes × (max_envelope_files + 1)` bytes when no record is larger. | Zero or positive; needs `max_envelope_file_bytes`, which in turn needs at least 1. `guardian.yaml` ships 3, so at most 1 GiB. |
+| `audit.max_event_file_bytes` | Size at which the event log is renamed to `<file>.<UTC time of the rotation>`. `0` keeps every record in one file, for a deployment that rotates it with its own tooling. | Zero or positive. `guardian.yaml` ships 268435456 (256 MiB). |
+| `audit.max_event_files` | Renamed event log files kept for the deployment to archive. None is deleted, since they hold the records §6.5, §9.2 and hooks.md require. While this many remain, every event is dropped and counted, every step that needs a required record is answered DENY `audit_unavailable`, and the first drop of each fill prints one line to stderr; moving the files away resumes logging. Every file named `<file>.<anything>` in that directory counts, so an archiver moves the files out rather than compressing them in place. | Zero or positive; needs `max_event_file_bytes`, which in turn needs at least 1. `guardian.yaml` ships 8, so at most 2.25 GiB: eight renamed files and the live one. |
+| `audit.max_queue_records` | Records waiting for the background writer, the one being written included. A record past it is dropped and counted. | Positive. `guardian.yaml` ships 4096. |
+| `audit.max_queue_bytes` | Bytes of records waiting for the writer, the one being written included, so a stalled disk holds at most this many bytes of records. A record past it is dropped and counted. | At least `2 × limits.max_body_bytes + 256`, so one request of the largest body fits. `guardian.yaml` ships 67108864 (64 MiB). |
 | `storage.provider` | Where sessions, replay history and policy state live. `memory`: in this process, lost when it stops, one process per endpoint. | `memory`, the one provider this command ships. A host that embeds the `guardian` package passes its own `SessionContextStore` for durability or replicas. |
 
 Envelope records contain raw requests and answers, including tool arguments
-and results. Treat both audit files as sensitive. The writer is asynchronous
-and bounded. Shutdown gives the writer its own `server.shutdown_grace`; failure
-to flush makes the command exit with an error.
+and results. Treat both audit files as sensitive.
+
+To replace the HMAC secret while agents move to it one at a time:
+
+1. Give the new secret its own `key_id`. Set it as `security.hmac_key_id` and
+   `security.hmac_secret_file`, move the old pair into
+   `security.hmac_previous_keys`, and restart the Guardian. It now accepts
+   both keys.
+2. Move each agent to the new `key_id` and secret between its sessions. A
+   session keeps the `key_id` that opened it: a step signed under another
+   `key_id` is answered DENY `key_not_bound`.
+3. When no agent uses the old key, remove it from `security.hmac_previous_keys`
+   and restart the Guardian.
+
+Each restart ends the sessions the `memory` provider holds, so agents open new
+ones.
+
+A background writer appends the records, so a slow disk never delays a
+decision. The exception is `modify_unsupported`, `ask_substituted` and
+`request_id_ref_unresolved`, which §6.5, §9.2 and hooks.md require: the step waits for that record to be written, until the recording deadline
+that `protocol.answer_margin` sets, and is answered DENY `audit_unavailable` when it is
+not. When a record would take its queue past `audit.max_queue_records`
+or `audit.max_queue_bytes`, it is dropped and counted; logging continues as
+space frees. A write failure turns
+the log off for the rest of the process, and every later record is dropped
+and counted; until the Guardian restarts, every step that needs one of
+them is answered DENY `audit_unavailable`. The first queue-full drop, the first write failure and the first
+record offered after shutdown closed the log each print one line to stderr. A
+dropped record keeps its `seq`, so the numbers in a file skip it within one
+run. Shutdown gives the writer its own `server.shutdown_grace`. The command
+exits with an error when a record was dropped or the queue did not flush, and
+names how many records were lost; a record offered after that count, by an
+engine that ignored cancellation, gets only its stderr line. The Guardian
+records a request before it checks the signature, so unsigned requests share
+the queue with signed ones and can push them out of a full queue.
 
 Two standalone processes may share this configuration file, policy directory
 and HMAC secret. Give each process its own `server.port`, `audit.envelope_log`
@@ -93,7 +127,8 @@ endpoint therefore embed the library with a shared `SessionContextStore`.
 | --- | --- | --- |
 | `protocol.on_decision_failure` | Failure posture advertised in `ServerHello`. | `proceed` or `deny`. |
 | `protocol.methods_evaluated` | Native hooks advertised in `ServerHello` as `methods_evaluated`. A hook left out is not evaluated: the Observed Agent treats it as ALLOW and need not send it (`handshake.json`). Unset, every native hook is evaluated. | Non-empty list of `steps/*` hooks, each once. |
-| `protocol.decision_timeout` | Default deadline for a policy decision. | Positive duration and shorter than `server.write_timeout`. |
+| `protocol.decision_timeout` | The deadline the `ServerHello` declares to the agent as `timeout_config`. | Positive duration and shorter than `server.write_timeout`. |
+| `protocol.answer_margin` | Part of `decision_timeout` the Guardian keeps after the decision: half to record it, half to sign and send the answer, network time included. Reading a request and its policy decision end at `decision_timeout` minus `answer_margin` after the request arrives; a step still undecided then is answered DENY `evaluation_failed`, while the agent still waits. A session negotiated under another `decision_timeout` keeps the same proportion; its lock and load run under this Guardian's own deadline, since its terms are known only once it is loaded, and the rest of its step under its own timeout. Each Guardian that shares a store sets `server.write_timeout` above the longest `decision_timeout` among them. | Positive and shorter than `decision_timeout`; `policy.opa_timeout` is shorter than the difference. `guardian.yaml` ships 500ms. |
 | `protocol.skew_window` | Accepted timestamp distance in either direction. | Positive duration. |
 
 `on_decision_failure` tells the Observed Agent what to do when it cannot obtain

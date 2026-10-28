@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	jsonv2 "github.com/go-json-experiment/json"
@@ -16,41 +18,119 @@ import (
 
 // JSONLAuditLog is an AuditLog, cmd/guardian's: it appends envelopes to one JSON
 // Lines file and audit events to another, from a background writer, so a
-// slow disk never delays a decision.
+// slow disk delays only a step that needs a required event (RequiredEvent).
 //
 // The envelope file has the TypeScript reference's line shape, {seq,
 // recorded_at, direction, method, rpc_id, envelope} with direction request
-// or response, so its Inspector reads it. Records beyond the queue's
-// capacity are dropped and counted, and a write failure disables the log;
-// both are reported through onError once, never to the caller.
+// or response, so its Inspector reads it.
+//
+// The queue holds the records JSONLQueue allows, the record being written
+// included. A record that would exceed either limit is dropped and counted,
+// and logging continues as space frees. An event file that holds all the
+// rotated files it may keep drops and counts each event until the deployment
+// archives them. Any other write failure turns the log off for the rest of
+// the process: the failed record and every later one are dropped and counted.
+// Each kind of failure
+// reaches onError once, never the caller, and Close reports every dropped
+// record.
 type JSONLAuditLog struct {
 	queue   chan line
 	done    chan struct{}
 	onError func(error)
+	limits  JSONLQueue
 
-	mu       sync.Mutex
-	closed   bool
-	dropped  int
-	failure  error
-	reported bool
+	mu                sync.Mutex
+	closed            bool
+	failed            bool
+	queued            int
+	queuedBytes       int64
+	envelopes, events int
+	dropped           int
+	queueFull         error
+	writeFailure      error
+	offeredAfterClose error
+	requiredLate      error
+	eventLogFull      error
 }
 
-// line is one record to write; exactly one of its fields is set. The writer
-// numbers it from one per process run, so a reader detects gaps within a run;
-// a restart appending to the same file repeats the numbers already in it.
+// line is one record to write; exactly one of envelope and event is set.
+// It is numbered when offered, from one per file and process run, so a
+// record dropped from a full queue leaves a gap a reader detects; a restart
+// appending to the same file repeats the numbers already in it.
 type line struct {
 	envelope *envelopeLine
 	event    *eventLine
+	size     int64
+	// written, set for a required event, receives the outcome of its write.
+	written chan error
+	// state, set for a required event, is linePending until the writer takes
+	// it (lineWriting) or its waiter gives up first (lineAbandoned), so an
+	// event the Guardian did not act on is not written. A write already under
+	// way when the waiter gives up may still land; the Guardian's failure
+	// record for the same request follows it.
+	state *atomic.Int32
 }
 
-// JSONLQueueCapacity is how many records the writer holds before it drops.
-const JSONLQueueCapacity = 4096
+const (
+	linePending int32 = iota
+	lineWriting
+	lineAbandoned
+)
 
-// JSONLRotation bounds each of the two files. When a record would take a
-// file past MaxFileBytes, the file is renamed to <path>.1, earlier ones move
-// up to <path>.2 and so on, and the one past MaxFiles is deleted, so a log
-// keeps at most MaxFileBytes × (MaxFiles + 1) bytes, plus one record larger
-// than MaxFileBytes. The zero value keeps every record: a deployment that
+// JSONLQueue bounds the records the writer holds. Zero means the default.
+type JSONLQueue struct {
+	MaxQueueRecords int
+	MaxQueueBytes   int64
+}
+
+const (
+	// DefaultMaxQueueRecords holds about 6.5 MiB at the 1.6 KB per step
+	// docs/load.md measures.
+	DefaultMaxQueueRecords = 4096
+	// DefaultMaxQueueBytes holds a stalled disk to 64 MiB of records rather
+	// than DefaultMaxQueueRecords requests of DefaultMaxBodyBytes, 4 GiB.
+	DefaultMaxQueueBytes = 64 << 20
+)
+
+// Validate refuses a negative limit.
+func (q JSONLQueue) Validate() error {
+	if q.MaxQueueRecords < 0 || q.MaxQueueBytes < 0 {
+		return errors.New("max_queue_records and max_queue_bytes cannot be negative")
+	}
+	return nil
+}
+
+func (q JSONLQueue) withDefaults() JSONLQueue {
+	if q.MaxQueueRecords == 0 {
+		q.MaxQueueRecords = DefaultMaxQueueRecords
+	}
+	if q.MaxQueueBytes == 0 {
+		q.MaxQueueBytes = DefaultMaxQueueBytes
+	}
+	return q
+}
+
+// JSONLRecordBytes is the most that the record of a request of bodyBytes
+// counts against MaxQueueBytes: the body, its method and JSON-RPC id, which
+// are copied out of it, and the fixed part of a record. A MaxQueueBytes below
+// it drops every such request.
+func JSONLRecordBytes(bodyBytes int64) int64 {
+	return lineOverheadBytes + 2*bodyBytes
+}
+
+// lineOverheadBytes is the memory a record holds beyond its variable-length
+// fields: the structs, pointers and timestamp.
+const lineOverheadBytes = 256
+
+// JSONLRotation bounds one of the two files. When a record would take the
+// file past MaxFileBytes, the file is renamed, so each file holds at most
+// MaxFileBytes, or one record larger than that, and MaxFiles + 1 files are
+// kept. The envelope file becomes <path>.1, earlier ones move up to
+// <path>.2 and so on, and the one past MaxFiles is deleted. The event file
+// holds events the standard requires, which are never deleted: it becomes
+// <path>.<UTC time of the rotation>, kept for the deployment to archive, and
+// while MaxFiles of them remain, each event is dropped and counted and a
+// required one fails. The zero value keeps every record: a deployment that
 // rotates the files with its own tooling leaves it unset.
 type JSONLRotation struct {
 	MaxFileBytes int64
@@ -63,25 +143,36 @@ type JSONLRotation struct {
 func (r JSONLRotation) Validate() error {
 	switch {
 	case r.MaxFileBytes < 0 || r.MaxFiles < 0:
-		return errors.New("max_file_bytes and max_files cannot be negative")
+		return errors.New("the file size and the file count cannot be negative")
 	case r.MaxFileBytes == 0 && r.MaxFiles != 0:
-		return errors.New("max_files needs max_file_bytes")
+		return errors.New("a file count needs a file size")
 	case r.MaxFileBytes > 0 && r.MaxFiles == 0:
-		return errors.New("max_file_bytes needs max_files of at least 1, or each rotation deletes the live log")
+		return errors.New("a file size needs a file count of at least 1")
 	}
 	return nil
 }
 
 // NewJSONLAuditLog opens (creating directories as needed) the two files and
-// starts the writer. onError, which may be nil, receives the first failure
-// asynchronously, so it may safely close the log.
-func NewJSONLAuditLog(envelopePath, eventPath string, rotation JSONLRotation, onError func(error)) (*JSONLAuditLog, error) {
-	if err := rotation.Validate(); err != nil {
+// starts the writer. onError, which may be nil, receives the first failure of
+// each kind - queue full, write failure, full event file, offer after Close -
+// asynchronously and possibly concurrently, so it may safely close the log.
+func NewJSONLAuditLog(envelopePath, eventPath string, envelopes, events JSONLRotation, queue JSONLQueue, onError func(error)) (*JSONLAuditLog, error) {
+	if err := envelopes.Validate(); err != nil {
+		return nil, fmt.Errorf("envelope file rotation: %w", err)
+	}
+	if err := events.Validate(); err != nil {
+		return nil, fmt.Errorf("event file rotation: %w", err)
+	}
+	if err := queue.Validate(); err != nil {
 		return nil, err
 	}
 	var files [2]auditFile
 	for i, path := range []string{envelopePath, eventPath} {
-		f, err := openRotatingFile(path, rotation)
+		rotation := envelopes
+		if i == 1 {
+			rotation = events
+		}
+		f, err := openRotatingFile(path, rotation, i == 1)
 		if err != nil {
 			if files[0] != nil {
 				_ = files[0].Close()
@@ -90,7 +181,43 @@ func NewJSONLAuditLog(envelopePath, eventPath string, rotation JSONLRotation, on
 		}
 		files[i] = f
 	}
-	return newJSONLAuditLog(files, onError), nil
+	if err := separatePaths(envelopePath, eventPath); err != nil {
+		_ = files[0].Close()
+		_ = files[1].Close()
+		return nil, err
+	}
+	return newJSONLAuditLog(files, queue, onError), nil
+}
+
+// separatePaths refuses two audit paths where one file, or a file one of them
+// rotates to, is the other: the envelope file's rotation would then delete
+// events the standard requires. It runs once both directories exist, so it
+// compares them with symbolic links resolved.
+func separatePaths(envelopePath, eventPath string) error {
+	envelope, err := resolvedPath(envelopePath)
+	if err != nil {
+		return err
+	}
+	event, err := resolvedPath(eventPath)
+	if err != nil {
+		return err
+	}
+	if envelope == event || strings.HasPrefix(event, envelope+".") || strings.HasPrefix(envelope, event+".") {
+		return fmt.Errorf("the envelope and event files must not share a path or rotate onto each other: %s, %s", envelopePath, eventPath)
+	}
+	return nil
+}
+
+func resolvedPath(path string) (string, error) {
+	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(path)), nil
 }
 
 // rotatingFile appends to path and rotates it as JSONLRotation describes.
@@ -98,15 +225,18 @@ func NewJSONLAuditLog(envelopePath, eventPath string, rotation JSONLRotation, on
 type rotatingFile struct {
 	path     string
 	rotation JSONLRotation
-	f        *os.File
-	size     int64
+	// keepRotated renames a full file by its rotation time and deletes none.
+	keepRotated bool
+	now         func() time.Time
+	f           *os.File
+	size        int64
 }
 
-func openRotatingFile(path string, rotation JSONLRotation) (*rotatingFile, error) {
+func openRotatingFile(path string, rotation JSONLRotation, keepRotated bool) (*rotatingFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	r := &rotatingFile{path: path, rotation: rotation}
+	r := &rotatingFile{path: path, rotation: rotation, keepRotated: keepRotated, now: time.Now}
 	if err := r.open(); err != nil {
 		return nil, err
 	}
@@ -114,7 +244,7 @@ func openRotatingFile(path string, rotation JSONLRotation) (*rotatingFile, error
 }
 
 func (r *rotatingFile) open() error {
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|auditOpenFlags, 0o600)
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_RDWR|os.O_APPEND|auditOpenFlags, 0o600)
 	if err != nil {
 		return auditOpenError(r.path, err)
 	}
@@ -128,6 +258,10 @@ func (r *rotatingFile) open() error {
 		return err
 	}
 	r.f, r.size = f, info.Size()
+	if err := r.endUnfinishedLine(); err != nil {
+		_ = f.Close()
+		return err
+	}
 	return nil
 }
 
@@ -145,8 +279,37 @@ func (r *rotatingFile) Write(b []byte) (int, error) {
 }
 
 func (r *rotatingFile) rotate() error {
+	if r.keepRotated {
+		kept, err := r.rotatedFiles()
+		if err != nil {
+			return err
+		}
+		if kept >= r.rotation.MaxFiles {
+			return errEventFileFull
+		}
+	}
 	if err := r.f.Close(); err != nil {
 		return err
+	}
+	if r.keepRotated {
+		// A clock that is coarse or steps back can repeat a name, and a
+		// rename would replace the file that holds it.
+		stamped := r.path + "." + r.now().UTC().Format("20060102T150405.000000000Z")
+		name := stamped
+		for i := 1; ; i++ {
+			_, err := os.Lstat(name)
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			name = fmt.Sprintf("%s-%d", stamped, i)
+		}
+		if err := os.Rename(r.path, name); err != nil {
+			return err
+		}
+		return r.open()
 	}
 	numbered := func(i int) string { return fmt.Sprintf("%s.%d", r.path, i) }
 	keep := r.rotation.MaxFiles
@@ -170,6 +333,42 @@ func (r *rotatingFile) rotate() error {
 	return r.open()
 }
 
+// endUnfinishedLine ends a last line that a crash left without its newline,
+// so the next record starts a line of its own rather than joining that one.
+func (r *rotatingFile) endUnfinishedLine() error {
+	if r.size == 0 {
+		return nil
+	}
+	last := make([]byte, 1)
+	if _, err := r.f.ReadAt(last, r.size-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	n, err := r.f.Write([]byte{'\n'})
+	r.size += int64(n)
+	return err
+}
+
+// rotatedFiles counts the event files rotation renamed and the deployment
+// has not yet moved away, matched by name rather than as a pattern, since a
+// path may hold characters a pattern reads.
+func (r *rotatingFile) rotatedFiles() (int, error) {
+	entries, err := os.ReadDir(filepath.Dir(r.path))
+	if err != nil {
+		return 0, err
+	}
+	prefix := filepath.Base(r.path) + "."
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (r *rotatingFile) Close() error { return r.f.Close() }
 
 type auditFile interface {
@@ -177,8 +376,9 @@ type auditFile interface {
 	Close() error
 }
 
-func newJSONLAuditLog(files [2]auditFile, onError func(error)) *JSONLAuditLog {
-	l := &JSONLAuditLog{queue: make(chan line, JSONLQueueCapacity), done: make(chan struct{}), onError: onError}
+func newJSONLAuditLog(files [2]auditFile, queue JSONLQueue, onError func(error)) *JSONLAuditLog {
+	limits := queue.withDefaults()
+	l := &JSONLAuditLog{queue: make(chan line, limits.MaxQueueRecords), done: make(chan struct{}), onError: onError, limits: limits}
 	go l.write(files)
 	return l
 }
@@ -210,7 +410,10 @@ func (l *JSONLAuditLog) Envelope(_ context.Context, r EnvelopeRecord) {
 	}
 	var method *string
 	if r.Method != "" {
-		method = &r.Method
+		// A pointer into r would keep r.Body, the caller's buffer, alive
+		// beside the copy the queue counts.
+		m := r.Method
+		method = &m
 	}
 	var head struct {
 		ID json.RawMessage `json:"id"`
@@ -222,77 +425,161 @@ func (l *JSONLAuditLog) Envelope(_ context.Context, r EnvelopeRecord) {
 	}
 	// The body is copied: the caller may reuse its buffer once Envelope
 	// returns, and the writer reads it later.
-	l.enqueue(line{envelope: &envelopeLine{RecordedAt: stamp(r.RecordedAt), Direction: direction, Method: method, RPCID: slices.Clone(id), Envelope: slices.Clone(r.Body)}})
+	l.enqueue(line{
+		envelope: &envelopeLine{RecordedAt: stamp(r.RecordedAt), Direction: direction, Method: method, RPCID: slices.Clone(id), Envelope: slices.Clone(r.Body)},
+		size:     lineOverheadBytes + int64(len(r.Method)+len(id)+len(r.Body)),
+	})
 }
 
 // Event implements AuditLog.
 func (l *JSONLAuditLog) Event(_ context.Context, e AuditEvent) {
-	l.enqueue(line{event: &eventLine{RecordedAt: stamp(e.RecordedAt), Kind: e.Kind, SessionID: e.SessionID, RequestID: e.RequestID, Method: e.Method, Message: e.Message}})
+	_ = l.enqueue(eventLineOf(e))
+}
+
+// RequiredEvent implements AuditLog: it queues the event like any other and
+// waits for the writer to write it.
+func (l *JSONLAuditLog) RequiredEvent(ctx context.Context, e AuditEvent) error {
+	ln := eventLineOf(e)
+	ln.written, ln.state = make(chan error, 1), new(atomic.Int32)
+	if err := l.enqueue(ln); err != nil {
+		return err
+	}
+	select {
+	case err := <-ln.written:
+		return err
+	case <-ctx.Done():
+		ln.state.CompareAndSwap(linePending, lineAbandoned)
+		l.mu.Lock()
+		report := l.firstOf(&l.requiredLate, errors.New("audit log did not write a required event by its deadline"))
+		l.mu.Unlock()
+		report()
+		return context.Cause(ctx)
+	}
+}
+
+func eventLineOf(e AuditEvent) line {
+	return line{
+		event: &eventLine{RecordedAt: stamp(e.RecordedAt), Kind: e.Kind, SessionID: e.SessionID, RequestID: e.RequestID, Method: e.Method, Message: e.Message},
+		size:  lineOverheadBytes + int64(len(e.Kind)+len(e.SessionID)+len(e.RequestID)+len(e.Method)+len(e.Message)),
+	}
 }
 
 func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
-// enqueue queues a record, or drops and counts it when the queue is full
-// or the log is closed. onError is called after the lock is released, so a
-// slow or re-entrant callback cannot hold a governed request.
-func (l *JSONLAuditLog) enqueue(ln line) {
-	var failure error
+// enqueue numbers a record and queues it, or drops and counts it when the
+// queue is full, the log has failed or the log is closed, and says which.
+// onError is called after the lock is released, so a slow or re-entrant
+// callback cannot hold a governed request.
+func (l *JSONLAuditLog) enqueue(ln line) (dropped error) {
+	report := func() {}
 	l.mu.Lock()
+	if ln.envelope != nil {
+		l.envelopes++
+		ln.envelope.Seq = l.envelopes
+	} else {
+		l.events++
+		ln.event.Seq = l.events
+	}
 	switch {
 	case l.closed:
 		l.dropped++
-		failure = errors.New("audit log closed; records are being dropped")
+		dropped = errAuditLogClosed
+		report = l.firstOf(&l.offeredAfterClose, errors.New("audit log closed; records are being dropped and counted"))
+	case l.failed:
+		l.dropped++
+		dropped = errAuditLogFailed
+	case l.queued == l.limits.MaxQueueRecords || l.queuedBytes+ln.size > l.limits.MaxQueueBytes:
+		l.dropped++
+		dropped = errAuditQueueFull
+		report = l.firstOf(&l.queueFull, errors.New("audit log queue full; records are being dropped and counted"))
 	default:
-		select {
-		case l.queue <- ln:
-		default:
-			l.dropped++
-			failure = errors.New("audit log queue full; records are being dropped")
-		}
+		l.queued++
+		l.queuedBytes += ln.size
+		// Never blocks: the channel holds at most queued records, and queued
+		// falls only after the writer has received a record and written it.
+		l.queue <- ln
 	}
 	l.mu.Unlock()
-	if failure != nil {
-		l.report(failure)
-	}
+	report()
+	return dropped
 }
 
+// errEventFileFull is the write error while the event file holds all the
+// rotated files it may keep.
+var errEventFileFull = errors.New("the audit event file is full until its rotated files are archived")
+
+// The reasons enqueue drops a record.
+var (
+	errAuditLogClosed = errors.New("the audit log is closed")
+	errAuditLogFailed = errors.New("the audit log failed and is off")
+	errAuditQueueFull = errors.New("the audit log queue is full")
+)
+
+// write writes each queued record and releases its place in the queue only
+// once its write returns, so the record in flight counts against the limits.
 func (l *JSONLAuditLog) write(files [2]auditFile) {
 	defer close(l.done)
-	var envelopes, events int
 	failed := false
 	for ln := range l.queue {
-		if failed {
-			continue
+		var err error
+		abandoned := ln.state != nil && !ln.state.CompareAndSwap(linePending, lineWriting)
+		if !failed && !abandoned {
+			err = writeLine(files, ln)
 		}
-		var (
-			f      auditFile
-			record any
-		)
-		if ln.envelope != nil {
-			envelopes++
-			ln.envelope.Seq, f, record = envelopes, files[0], ln.envelope
-		} else {
-			events++
-			ln.event.Seq, f, record = events, files[1], ln.event
+		l.mu.Lock()
+		l.queued--
+		l.queuedBytes -= ln.size
+		report := func() {}
+		if failed || err != nil || abandoned {
+			l.dropped++
 		}
-		b, err := jsonv2.Marshal(record)
-		if err == nil {
-			_, err = f.Write(append(b, '\n'))
+		switch {
+		case err == nil && ln.event != nil && !failed && !abandoned:
+			// The event file takes events again; its next fill reports anew.
+			l.eventLogFull = nil
+		case errors.Is(err, errEventFileFull):
+			report = l.firstOf(&l.eventLogFull, errors.New("audit event file holds all the rotated files it may keep; events are dropped and counted until they are archived"))
+		case err != nil:
+			failed, l.failed = true, true
+			report = l.firstOf(&l.writeFailure, fmt.Errorf("audit log write failed; logging is off for the rest of the process: %w", err))
 		}
-		if err != nil {
-			failed = true
-			l.report(err)
+		l.mu.Unlock()
+		report()
+		if ln.written != nil {
+			if failed && err == nil {
+				err = errAuditLogFailed
+			}
+			ln.written <- err
 		}
 	}
 	for _, f := range files {
-		if err := f.Close(); err != nil && !failed {
-			l.report(err)
+		if err := f.Close(); err != nil {
+			l.mu.Lock()
+			report := l.firstOf(&l.writeFailure, fmt.Errorf("audit log close failed: %w", err))
+			l.mu.Unlock()
+			report()
 		}
 	}
 }
 
+func writeLine(files [2]auditFile, ln line) error {
+	f, record := files[0], any(ln.envelope)
+	if ln.event != nil {
+		f, record = files[1], ln.event
+	}
+	b, err := jsonv2.Marshal(record)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(b, '\n'))
+	return err
+}
+
 // Close writes every queued record and closes the files until ctx expires.
-// Records sent after Close are dropped and reported.
+// It returns the first error of each kind and the number of records that did
+// not reach the files, counting those still queued when ctx expires. Records
+// sent after Close are dropped and counted, and reported only through
+// onError.
 func (l *JSONLAuditLog) Close(ctx context.Context) error {
 	l.mu.Lock()
 	if !l.closed {
@@ -300,33 +587,35 @@ func (l *JSONLAuditLog) Close(ctx context.Context) error {
 		close(l.queue)
 	}
 	l.mu.Unlock()
+	var timeout error
 	select {
 	case <-l.done:
 	case <-ctx.Done():
-		return ctx.Err()
+		timeout = ctx.Err()
 	}
 	l.mu.Lock()
-	dropped, failure := l.dropped, l.failure
-	l.mu.Unlock()
-	var droppedErr error
-	if dropped > 0 {
-		droppedErr = fmt.Errorf("the audit log dropped %d records", dropped)
+	defer l.mu.Unlock()
+	errs := []error{timeout, l.writeFailure, l.queueFull, l.offeredAfterClose, l.requiredLate, l.eventLogFull}
+	switch {
+	case timeout != nil && l.queued > 0:
+		errs = append(errs, fmt.Errorf("the audit log dropped %d records and %d were still queued", l.dropped, l.queued))
+	case l.dropped > 0:
+		errs = append(errs, fmt.Errorf("the audit log dropped %d records", l.dropped))
 	}
-	return errors.Join(failure, droppedErr)
+	return errors.Join(errs...)
 }
 
-// report sends the first failure to onError outside l.mu. The callback runs
-// asynchronously because a synchronous callback that closes the log would
-// otherwise wait for the writer that called it.
-func (l *JSONLAuditLog) report(err error) {
-	l.mu.Lock()
-	first := !l.reported
-	if l.failure == nil {
-		l.failure = err
+// firstOf keeps err in *slot when it is the first of its kind and returns the
+// report to make after l.mu is released. The callback runs asynchronously
+// because a synchronous callback that closes the log would otherwise wait for
+// the writer that called it. Callers hold l.mu.
+func (l *JSONLAuditLog) firstOf(slot *error, err error) func() {
+	if *slot != nil {
+		return func() {}
 	}
-	l.reported = true
-	l.mu.Unlock()
-	if first && l.onError != nil {
-		go l.onError(err)
+	*slot = err
+	if l.onError == nil {
+		return func() {}
 	}
+	return func() { go l.onError(err) }
 }
