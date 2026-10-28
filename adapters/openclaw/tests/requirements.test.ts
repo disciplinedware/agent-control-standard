@@ -15,7 +15,7 @@ const example = await Bun.file(new URL("../openclaw.json.example", import.meta.u
  * One OpenClaw deployment: its config, release and plugin API, the session the
  * steps come from, and that session's entry. `session.runtime` is the runtime
  * OpenClaw picks for the session's next run; a session entry's override
- * (`agentRuntimeOverride`, `src/config/sessions/types.ts:495`) can make it
+ * (`agentRuntimeOverride`, `src/config/sessions/types.ts:506`) can make it
  * `codex` whatever the config says, and the plugin cannot read it.
  */
 type Deployment = { settings: Record<string, unknown>; version: string; registrar: boolean; runStateStore: boolean; sessionKey: string; session: { runtime: "openclaw" | "codex" } };

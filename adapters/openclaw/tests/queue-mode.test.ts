@@ -1,7 +1,7 @@
 /**
  * The queue mode is OpenClaw's to resolve: an inline directive, the session
  * entry, then the config (`resolveQueueSettingsCore`,
- * `src/auto-reply/reply/queue/settings.ts:29-34`). Whatever the config says,
+ * `src/auto-reply/reply/queue/settings.ts:18-34`). Whatever the config says,
  * a message that arrives while its session has an admitted run is decided at
  * dispatch, against that run's turn, through the real plugin entry.
  */

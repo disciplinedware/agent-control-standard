@@ -402,33 +402,54 @@ function trimmedString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+/** Where a `message` call acts, as `messageTargetOf` reads its parameters. */
+type MessageTarget = {
+  channel: string;
+  /** The account the call names, else its run's; `undefined` when neither is known. */
+  accountId?: string;
+  named: boolean;
+  recipients: string[];
+  /** The recipients a delivery grant covers, and OpenClaw's "Send to" scope names: `recipients` for an action in `MESSAGE_SEND_ACTIONS`, else none. */
+  granted: string[];
+};
+
 /**
- * The grant a `message` call's parameters make for its run, or `undefined`
- * when its action delivers nothing or it names no recipient. A call that
- * names none on the run's own channel goes to the current conversation
- * (OpenClaw's `message-action-normalization`), whose person is the run's
- * sender. A recipient is the string the Guardian saw, trimmed: OpenClaw gives
- * a plugin no channel's target normalizer, so a recipient written in another
- * form than the one OpenClaw delivers to matches nothing, and its delivery
- * takes the session's path.
+ * Where a `message` call acts: the channel and account it names, else its
+ * run's, and the recipients it names. A call that names none on the run's own
+ * channel acts in the current conversation (OpenClaw's
+ * `message-action-normalization`), whose person is the run's sender; one that
+ * names none on another channel has no recipient the plugin knows. A recipient
+ * is the string the Guardian saw, trimmed: OpenClaw gives a plugin no
+ * channel's target normalizer, so a recipient written in another form than
+ * the one OpenClaw delivers to matches nothing, and its delivery takes the
+ * session's path.
  */
-function sendGrantOf(callId: string, runId: string, run: AdmittedRun, params: Record<string, unknown>): SendGrant | undefined {
-  if (!MESSAGE_SEND_ACTIONS.has(params.action)) {
-    return undefined;
-  }
+function messageTargetOf(run: AdmittedRun, params: Record<string, unknown>): MessageTarget {
   const channel = trimmedString(params.channel)?.toLowerCase() ?? run.userContext.authentication_method;
   const named = messageRecipients(params);
-  const recipients = new Set(named.length > 0 ? named : channel === run.userContext.authentication_method ? [run.userContext.user_id] : []);
-  if (recipients.size === 0) {
+  const recipients = named.length > 0 ? named : channel === run.userContext.authentication_method ? [run.userContext.user_id] : [];
+  return {
+    channel,
+    accountId: readStringParam(params, "accountId") ?? run.accountId,
+    named: named.length > 0,
+    recipients,
+    granted: MESSAGE_SEND_ACTIONS.has(params.action) ? recipients : [],
+  };
+}
+
+/** The grant a `message` call's parameters make for its run, or `undefined` when it grants no recipient. */
+function sendGrantOf(callId: string, runId: string, run: AdmittedRun, params: Record<string, unknown>): SendGrant | undefined {
+  const target = messageTargetOf(run, params);
+  if (target.granted.length === 0) {
     return undefined;
   }
   return {
     callId,
     runId,
     run,
-    channel,
-    accountId: readStringParam(params, "accountId") ?? run.accountId,
-    recipients,
+    channel: target.channel,
+    accountId: target.accountId,
+    recipients: new Set(target.granted),
     words: typeof params.message === "string" ? wordsOf(params.message) : "",
   };
 }
@@ -502,28 +523,36 @@ function wrapArguments(params: Record<string, unknown>): Record<string, { value:
 /** The parameters a `message` call's approval shows on their own lines. */
 const MESSAGE_CALL_SHOWN_PARAMS: ReadonlySet<string> = new Set([...MESSAGE_TARGET_PARAMS, "targets", "message"]);
 
-/** The recipients a `message` call names, trimmed, in the order it names them. */
+/**
+ * The recipients a `message` call names, trimmed: the first of `target`, `to`
+ * and `channelId` it names, as OpenClaw drops the others
+ * (`normalizeMessageActionInput`, `src/infra/outbound/message-action-normalization.ts`),
+ * then each of `targets`.
+ */
 function messageRecipients(params: Record<string, unknown>): string[] {
-  const named = [...MESSAGE_TARGET_PARAMS.map((name) => params[name]), ...(Array.isArray(params.targets) ? params.targets : [])];
-  return [...new Set(named.map(trimmedString).filter((recipient): recipient is string => recipient !== undefined))];
+  const target = MESSAGE_TARGET_PARAMS.map((name) => trimmedString(params[name])).find((recipient) => recipient !== undefined);
+  const named = [target, ...(Array.isArray(params.targets) ? params.targets.map(trimmedString) : [])];
+  return [...new Set(named.filter((recipient): recipient is string => recipient !== undefined))];
 }
 
 /**
  * A `message` call as a person reads it: the recipients, the text whole, and
  * every other parameter as JSON, so nothing that changes the send is hidden.
- * A call that names no recipient goes to the current conversation, the
- * session's sender, unless a channel's own target parameter names another
+ * A call that names no recipient acts where `messageTargetOf` says, unless a
+ * channel's own target parameter names another recipient
  * (`resolveActionDeliveryTargetAlias`, `src/infra/outbound/message-action-spec.ts`),
- * which the plugin cannot read; the line says so rather than name the sender.
+ * which the plugin cannot read; the line says so after the recipient it names.
  */
-function messageCallLines(params: Record<string, unknown>, sender: string, displayName: (person: string) => string | undefined): string[] {
-  const recipients = messageRecipients(params);
+function messageCallLines(params: Record<string, unknown>, { named, recipients }: MessageTarget, displayName: (person: string) => string | undefined): string[] {
   const hidden = new Set(["replyContext", ...(params.action === "send" ? ["requestApproval", ...(typeof params.final === "boolean" ? ["final"] : [])] : [])]);
   const others = Object.keys(params).some((name) => !MESSAGE_CALL_SHOWN_PARAMS.has(name) && !hidden.has(name) && name !== "action");
+  const people = recipients.map((person) => personLabel(person, displayName(person))).join("; ");
   const lines = [
-    recipients.length > 0
-      ? `👤 ${recipients.map((person) => displayName(person) ? `${displayName(person)} · ${person}` : person).join("; ")}`
-      : `👤 ${displayName(sender) ? `${displayName(sender)} · ` : ""}${sender}${others ? ", unless a parameter under Other names another recipient" : ""}`,
+    named
+      ? `👤 ${people}`
+      : recipients.length > 0
+        ? `👤 ${people}${others ? ", unless a parameter under Other names another recipient" : ""}`
+        : `👤 no recipient named${others ? ", unless a parameter under Other names one" : ""}`,
   ];
   if (typeof params.message === "string") {
     lines.push(...quotedTextLines("💬", params.message));
@@ -531,13 +560,26 @@ function messageCallLines(params: Record<string, unknown>, sender: string, displ
   const shown = new Set<string>([...MESSAGE_CALL_SHOWN_PARAMS, ...(params.action === "send" ? ["action"] : [])]);
   const rest = Object.fromEntries(Object.entries(params).filter(([name]) => !shown.has(name) && !hidden.has(name)));
   if (Object.keys(rest).length > 0) {
-    lines.push(`Other: ${JSON.stringify(rest)}`);
+    lines.push(`Other: ${oneLine(JSON.stringify(rest))}`);
   }
   return lines;
 }
 
+/** A person as an approval names them: the display name the person chose, quoted so none of it reads as an id or a separator, then the id. */
+function personLabel(person: string, name: string | undefined): string {
+  return name === undefined ? oneLine(person) : `${JSON.stringify(name)} · ${oneLine(person)}`;
+}
+
+/** Every line break OpenClaw's approval display renders as one (`normalizeDisplayLineBreaks`, `src/infra/exec-approval-text-sanitize.ts`). */
+const DISPLAY_LINE_BREAK = /\r\n?|[\n\u2028\u2029]/gu;
+
+/** Text that stays on its line of an approval: each line break is written as its `\u` escape, so no part of the text reads as a line of its own. */
+function oneLine(text: string): string {
+  return text.replace(DISPLAY_LINE_BREAK, (lineBreak) => [...lineBreak].map((char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""));
+}
+
 function quotedTextLines(label: string, text: string): string[] {
-  return [label, ...text.split("\n").map((line) => `  | ${line}`)];
+  return [label, ...text.split(DISPLAY_LINE_BREAK).map((line) => `  | ${line}`)];
 }
 
 /** Never truncate an approved call: a partial preview would authorize unseen text. */
@@ -547,7 +589,8 @@ function approvalDescription(
   approverId: string,
   toolName: string,
   params: Record<string, unknown>,
-  sender: string,
+  target: MessageTarget,
+  sender: { id: string; channel: string; name?: string },
   receivedText: string | undefined,
   displayName: (person: string) => string | undefined,
 ): string | undefined {
@@ -561,9 +604,9 @@ function approvalDescription(
   if (Array.isArray(details.options) && details.options.length > 0) {
     head.push(`Options: ${details.options.map(String).join("; ")}`);
   }
-  const call = toolName === MESSAGE_TOOL ? messageCallLines(params, sender, displayName) : [`Call: ${toolName} ${JSON.stringify(params)}`];
-  const incomingLabel = messageRecipients(params).some((recipient) => recipient !== sender)
-    ? `📥 ${displayName(sender) ? `${displayName(sender)} · ` : ""}${sender}`
+  const call = toolName === MESSAGE_TOOL ? messageCallLines(params, target, displayName) : [`Call: ${toolName} ${oneLine(JSON.stringify(params))}`];
+  const incomingLabel = target.channel !== sender.channel || target.recipients.length !== 1 || target.recipients[0] !== sender.id
+    ? `📥 ${personLabel(sender.id, sender.name)}`
     : "📥";
   const render = (incomingText?: string) => {
     if (toolName !== MESSAGE_TOOL) {
@@ -824,9 +867,6 @@ export function createHooks({
     onApproved: (params: Record<string, unknown>) => Promise<void> | void,
   ): BeforeToolCallResult {
     const { sessionId } = run;
-    const channel = run.userContext.authentication_method;
-    // The account the send goes out on, as its grant reads it.
-    const accountId = readStringParam(params, "accountId") ?? run.accountId;
     const details = decision.ask_details as AskDetails;
     const approverId = typeof details.approver?.id === "string" ? details.approver.id : "";
     const approverType = typeof details.approver?.type === "string" ? details.approver.type : "";
@@ -847,15 +887,18 @@ export function createHooks({
     const executionParams = isMessageApprovalRequest(toolName, params)
       ? { ...params, requestApproval: false }
       : params;
+    const target = messageTargetOf(run, executionParams);
+    const sender = run.userContext;
     const description = approvalDescription(
       details,
       decision,
       approverId,
       toolName,
       executionParams,
-      run.userContext.user_id,
+      target,
+      { id: sender.user_id, channel: sender.authentication_method, name: senderNames.get(personKey(sender.authentication_method, run.accountId, sender.user_id)) },
       run.receivedText,
-      (person) => senderNames.get(personKey(channel, accountId, person)),
+      (person) => senderNames.get(personKey(target.channel, target.accountId, person)),
     );
     if (description === undefined) {
       auditSubstitution(sessionId, METHODS.toolCallRequest, requestId, "ask", "approval_text_too_long");
@@ -870,17 +913,13 @@ export function createHooks({
       requireApproval: {
         title: truncate(`Approve ${toolName}?`, APPROVAL_TITLE_MAX),
         description,
-        ...(toolName === MESSAGE_TOOL ? {
-          scope: (() => {
-            const recipients = messageRecipients(executionParams);
-            const effectiveRecipients = recipients.length > 0 ? recipients : [run.userContext.user_id];
-            return {
-              kind: "message-send" as const,
-              target: channel,
-              recipientCount: effectiveRecipients.length,
-              recipients: effectiveRecipients.slice(0, 5),
-            };
-          })(),
+        ...(toolName === MESSAGE_TOOL && target.granted.length > 0 ? {
+          scope: {
+            kind: "message-send" as const,
+            target: target.channel,
+            recipientCount: target.granted.length,
+            recipients: target.granted.slice(0, 5),
+          },
         } : {}),
         severity: "warning",
         timeoutMs: details.timeout_seconds * 1000,
