@@ -1,6 +1,6 @@
 # OpenClaw hooks and ACS steps
 
-What each OpenClaw 2026.10.2 hook sends to the Guardian, and what the plugin does with each answer. [README.md](README.md) explains the rules behind each row.
+What each OpenClaw 2026.10.8 hook sends to the Guardian, and what the plugin does with each answer. [README.md](README.md) explains the rules behind each row.
 
 | OpenClaw hook | ACS steps, in order | `allow` | `deny` | Other decisions |
 |---|---|---|---|---|
@@ -19,7 +19,7 @@ What each OpenClaw 2026.10.2 hook sends to the Guardian, and what the plugin doe
 
 A decision-eligible step is sent only from a hook that can block (§6.4). These are not sent:
 
-| ACS step | OpenClaw 2026.10.2 | Why not |
+| ACS step | OpenClaw 2026.10.8 | Why not |
 |---|---|---|
 | `preCompact` | `before_compaction` only observes | Cannot block compaction |
 | `postCompact` | `after_compaction` | The event has no summary text, which the step requires |

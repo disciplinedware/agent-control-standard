@@ -1,6 +1,6 @@
 /**
  * The OpenClaw settings and capabilities the plugin's guarantees rest on, as
- * one table. Each row copies a rule of OpenClaw 2026.10.2, read at the point
+ * one table. Each row copies a rule of OpenClaw 2026.10.8, read at the point
  * OpenClaw itself reads it; R0 holds the table to that version, because a copy
  * does not notice when OpenClaw changes the rule. A failed row blocks: at
  * registration every step, at a run that run, at a dispatch that message.
@@ -9,7 +9,7 @@
 import { directivesAllowedBecause, notOneSenderSessionBecause, type OpenClawSettings } from "./openclaw-settings.ts";
 
 /** The OpenClaw release every row below was verified against. */
-export const VERIFIED_OPENCLAW_VERSION = "2026.10.2";
+export const VERIFIED_OPENCLAW_VERSION = "2026.10.8";
 
 export const PLUGIN_ID = "acs-guardian-client";
 

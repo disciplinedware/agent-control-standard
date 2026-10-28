@@ -45,7 +45,7 @@
  * its `steps/toolCallResult` (OpenClaw's tool-result middleware): `modify`
  * replaces it, and any answer but `allow` withholds it.
  *
- * The types below are the parts of OpenClaw 2026.10.2's plugin hook types
+ * The types below are the parts of OpenClaw 2026.10.8's plugin hook types
  * (`dist/channel-core-*.d.ts`) and tool-result middleware types this module
  * reads and writes.
  */
